@@ -10,6 +10,12 @@
       .sort(function (a, b) { return a.finishedAt.localeCompare(b.finishedAt); });
   }
 
+  // tournamentId: 'all' or one tournament's id
+  function filterByTournament(games, tournamentId) {
+    if (!tournamentId || tournamentId === 'all') return games.slice();
+    return games.filter(function (g) { return g.tournamentId === tournamentId; });
+  }
+
   // period: 'all' | 'year' (this calendar year) | '30d' (last 30 days)
   function filterByPeriod(games, period, nowDate) {
     var now = nowDate || new Date();
@@ -108,8 +114,9 @@
       delete s.streak;
       return s;
     });
+    // Leader = most game wins; a tie goes to fewer total points.
     players.sort(function (a, b) {
-      return b.wins - a.wins || b.winPct - a.winPct || a.avgPlace - b.avgPlace || a.name.localeCompare(b.name, 'he');
+      return b.wins - a.wins || a.totalPoints - b.totalPoints || a.name.localeCompare(b.name, 'he');
     });
 
     players.forEach(function (s) {
@@ -164,6 +171,7 @@
 
   var RummyStats = {
     finished: finished,
+    filterByTournament: filterByTournament,
     filterByPeriod: filterByPeriod,
     lastGame: lastGame,
     playerNames: playerNames,

@@ -1,7 +1,7 @@
 /* Offline support: network first (so updates show up at once), cache when there is no connection. */
-const CACHE = 'rummy51-v1';
+const CACHE = 'rummy51-v2';
 const CORE = [
-  './', 'index.html', 'style.css', 'logic.js', 'stats.js', 'sync.js', 'app.js',
+  './', 'index.html', 'style.css', 'logic.js', 'stats.js', 'tournaments.js', 'sync.js', 'app.js',
   'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'
 ];
 

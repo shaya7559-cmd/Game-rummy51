@@ -6,7 +6,7 @@
 <title>בדיקות רמי 51</title>
 <style>
   body { font: 15px/1.5 system-ui, "Segoe UI", Arial, sans-serif; margin: 16px; background: #fff; color: #1c1c1e; }
-  .pass { color: #1d7a4f; }
+  .pass { color: #2f6b3f; }
   .fail { color: #b42318; font-weight: 700; }
   #sum { font-size: 1.2rem; font-weight: 700; }
   li small { display: block; direction: ltr; text-align: left; font-family: Consolas, monospace; }
@@ -18,6 +18,7 @@
 <ol id="out"></ol>
 <script src="logic.js"></script>
 <script src="stats.js"></script>
+<script src="tournaments.js"></script>
 <script src="sync.js"></script>
 <script>
 (async function () {
@@ -353,6 +354,114 @@
     };
     await SY.flush(st, CFG);
     eq(SY.pending(st), 1, 'the newer version is still pending');
+  });
+
+  // ---------------- tournaments ----------------
+  const TT = RummyTournaments;
+  function finishedGame(names, tournamentId, finishedAt, winnerIdx, pts) {
+    const g = R.newGame(names, { rounds: 1 });
+    play(g, winnerIdx || 0, pts || names.map((n, k) => (k === (winnerIdx || 0) ? 0 : 10)));
+    R.finishGame(g);
+    g.finishedAt = finishedAt;
+    if (tournamentId) g.tournamentId = tournamentId;
+    return g;
+  }
+
+  test('הרכב: אותם שחקנים בכל סדר ישיבה הם אותו הרכב', () => {
+    eq(TT.lineupKey(['ב', 'א', 'ג']), TT.lineupKey(['ג', ' א ', 'ב']));
+    ok(TT.lineupKey(['א', 'ב']) !== TT.lineupKey(['א', 'ב', 'ג']), 'a different lineup');
+    eq(TT.defaultName(['אבא', ' דני', 'רון']), 'אבא · דני · רון');
+  });
+
+  test('בחירת טורניר: הטורניר האחרון של ההרכב, ובלי ארכיון', () => {
+    const t1 = TT.make('א · ב · ג', TT.lineupKey(['א', 'ב', 'ג']));
+    const t2 = TT.make('אצל סבתא', null);
+    const list = [t1, t2];
+    const games = [
+      finishedGame(['א', 'ב', 'ג'], t2.id, '2026-03-01T20:00:00.000Z'),
+      finishedGame(['ג', 'א', 'ב'], t1.id, '2025-03-01T20:00:00.000Z')
+    ];
+    eq(TT.suggest(list, games, ['ב', 'ג', 'א']).id, t2.id, 'the lineup played last in t2');
+    eq(TT.suggest(list, games, ['א', 'ב', 'ד']), null, 'a new lineup gets a new tournament');
+    t2.archived = true;
+    eq(TT.suggest(list, games, ['א', 'ב', 'ג']).id, t1.id, 'archived tournaments are not offered');
+    const t3 = TT.make('א · ב', TT.lineupKey(['א', 'ב']));
+    list.push(t3);
+    eq(TT.suggest(list, games, ['ב', 'א']).id, t3.id, 'a tournament opened for the lineup, before its first game');
+  });
+
+  test('משחקים מלפני הטורנירים מתחלקים לטורנירים לפי ההרכב', () => {
+    const games = [
+      finishedGame(['A', 'B', 'C'], null, '2026-01-01T20:00:00.000Z'),
+      finishedGame(['C', 'B', 'A'], null, '2026-01-02T20:00:00.000Z'),
+      finishedGame(['A', 'B'], null, '2026-01-03T20:00:00.000Z')
+    ];
+    const list = [];
+    const res = TT.ensure(list, games);
+    eq(res.games.length, 3);
+    eq(res.tournaments, true);
+    eq(list.map((t) => t.name), ['A · B · C', 'A · B']);
+    eq(games[0].tournamentId, games[1].tournamentId);
+    ok(games[2].tournamentId !== games[0].tournamentId, 'a different lineup, a different tournament');
+    eq(games[0].tournamentName, 'A · B · C');
+    eq(TT.ensure(list, games), { games: [], tournaments: false }, 'nothing left to fix');
+  });
+
+  test('טורניר שמוכר רק מתוך משחק נבנה מחדש, וטורניר מחוק עם משחק חוזר', () => {
+    const g = finishedGame(['A', 'B'], 'x1', '2026-01-01T20:00:00.000Z');
+    g.tournamentName = 'אצל סבתא';
+    const list = [];
+    eq(TT.ensure(list, [g]).tournaments, true);
+    eq([list[0].id, list[0].name], ['x1', 'אצל סבתא']);
+    list[0].deleted = true;
+    TT.ensure(list, [g]);
+    eq(list[0].deleted, false);
+  });
+
+  test('איחוד רשימות טורנירים: העדכון האחרון גובר', () => {
+    const a = { id: 'a', name: 'ישן', createdAt: '1', updatedAt: '2026-01-01' };
+    const b = { id: 'b', name: 'רק כאן', createdAt: '2', updatedAt: '2026-01-01' };
+    const a2 = { id: 'a', name: 'חדש', createdAt: '1', updatedAt: '2026-02-01' };
+    const c = { id: 'c', name: 'רק שם', createdAt: '3', updatedAt: '2026-01-01' };
+    const m = TT.merge([a, b], [a2, c]);
+    eq(m.list.map((t) => t.name), ['חדש', 'רק כאן', 'רק שם']);
+    eq([m.changed, m.ahead], [true, true]);
+    const same = TT.merge([a2, c], [a2, c]);
+    eq([same.changed, same.ahead], [false, false]);
+  });
+
+  test('מוביל הטורניר: הכי הרבה ניצחונות, ובשוויון פחות נקודות', () => {
+    const t = TT.make('בית', null);
+    const g1 = finishedGame(['A', 'B'], t.id, '2026-01-01T20:00:00.000Z', 0, [0, 50]); // A -30, B 50
+    const g2 = finishedGame(['A', 'B'], t.id, '2026-01-02T20:00:00.000Z', 1, [10, 0]); // A 10, B -30
+    const other = finishedGame(['A', 'B'], 'elsewhere', '2026-01-03T20:00:00.000Z', 1, [10, 0]);
+    const games = [g1, g2, other];
+    eq(ST.summary(ST.filterByTournament(games, t.id)).players.map((p) => [p.name, p.wins, p.totalPoints]), [['A', 1, -20], ['B', 1, 20]]);
+    const row = TT.overview([t], games)[0];
+    eq([row.games, row.leader.name, row.lastAt], [2, 'A', g2.finishedAt]);
+    eq(ST.filterByTournament(games, 'all').length, 3);
+  });
+
+  test('הטורנירים נשמרים בגיט ונטענים בטלפון חדש', async () => {
+    const gh = fakeGitHub();
+    SY.fetchImpl = gh.handler;
+    const a = newState();
+    a.tournaments = [TT.make('אצל סבתא', null)];
+    a.sync.tournamentsVersion = 1;
+    eq(SY.pending(a), 1);
+    await SY.flush(a, CFG);
+    eq(SY.pending(a), 0);
+    eq(gh.read('data/tournaments.json').tournaments[0].name, 'אצל סבתא');
+
+    const b = newState();
+    await SY.pull(b, CFG);
+    eq(b.tournaments.map((t) => t.name), ['אצל סבתא']);
+    eq(SY.pending(b), 0, 'nothing new to upload');
+    b.tournaments.push(TT.make('בבית', null));
+    await SY.pull(b, CFG);
+    eq(SY.pending(b), 1, 'a tournament that exists only here is queued');
+    await SY.flush(b, CFG);
+    eq(gh.read('data/tournaments.json').tournaments.map((t) => t.name), ['אצל סבתא', 'בבית']);
   });
 
   // ---------------- run ----------------

@@ -1,6 +1,7 @@
 /* Rummy 51 — saves games to a GitHub repository through the contents API.
    data/games/<date>_<id>.json  one file per finished game
    data/current.json            the game in progress (removed when there is none)
+   data/tournaments.json        the list of tournaments
    The token lives only in this device's localStorage; it is never part of the app's code. */
 (function (root) {
   'use strict';
@@ -8,6 +9,7 @@
   var API = 'https://api.github.com';
   var GAMES_DIR = 'data/games';
   var CURRENT = 'data/current.json';
+  var TOURNAMENTS = 'data/tournaments.json';
 
   // Tests replace fetchImpl with a fake GitHub.
   var Sync = { fetchImpl: null };
@@ -17,7 +19,10 @@
   }
 
   function emptySync() {
-    return { currentVersion: 0, syncedVersion: 0, unsyncedGames: [], deletedGames: [], lastSyncAt: null, lastError: null };
+    return {
+      currentVersion: 0, syncedVersion: 0, tournamentsVersion: 0, tournamentsSynced: 0,
+      unsyncedGames: [], deletedGames: [], lastSyncAt: null, lastError: null
+    };
   }
 
   // Accepts "owner/repo", "https://github.com/owner/repo" or "...repo.git".
@@ -130,7 +135,8 @@
 
   function pending(state) {
     var s = state.sync;
-    return s.unsyncedGames.length + s.deletedGames.length + (s.currentVersion !== s.syncedVersion ? 1 : 0);
+    return s.unsyncedGames.length + s.deletedGames.length +
+      (s.currentVersion !== s.syncedVersion ? 1 : 0) + (s.tournamentsVersion !== s.tournamentsSynced ? 1 : 0);
   }
 
   function removeFrom(list, item) {
@@ -138,7 +144,7 @@
     if (i >= 0) list.splice(i, 1);
   }
 
-  // Pushes everything waiting: finished games, deletions, and the game in progress.
+  // Pushes everything waiting: finished games, deletions, tournaments and the game in progress.
   // Mutates state.sync; the caller persists it.
   async function flush(state, cfg) {
     var s = state.sync;
@@ -155,6 +161,12 @@
     for (var j = 0; j < paths.length; j++) {
       await deleteFile(cfg, paths[j], 'מחיקת משחק');
       removeFrom(s.deletedGames, paths[j]);
+      done++;
+    }
+    if (s.tournamentsVersion !== s.tournamentsSynced) {
+      var tVersion = s.tournamentsVersion;
+      await putJSON(cfg, TOURNAMENTS, { tournaments: state.tournaments || [] }, 'עדכון טורנירים');
+      s.tournamentsSynced = tVersion;
       done++;
     }
     if (s.currentVersion !== s.syncedVersion) {
@@ -175,8 +187,8 @@
     return done;
   }
 
-  // Brings in finished games that exist only in the repository, and queues games that exist
-  // only here. Returns the repository's game in progress so the caller can offer it.
+  // Brings in finished games and tournaments that exist only in the repository, and queues
+  // what exists only here. Returns the repository's game in progress so the caller can offer it.
   async function pull(state, cfg) {
     var s = state.sync;
     var files = (await listDir(cfg, GAMES_DIR)).filter(function (f) {
@@ -202,12 +214,17 @@
     state.history.forEach(function (g) {
       if (!remoteIds[g.id] && s.unsyncedGames.indexOf(g.id) < 0) s.unsyncedGames.push(g.id);
     });
+    var remoteT = await getJSON(cfg, TOURNAMENTS);
+    var merged = root.RummyTournaments.merge(state.tournaments || [], remoteT && remoteT.data ? remoteT.data.tournaments : []);
+    state.tournaments = merged.list;
+    if (merged.ahead) s.tournamentsVersion++;
     var cur = await getJSON(cfg, CURRENT);
     return { added: added, remoteCurrent: cur ? cur.data : null };
   }
 
   Sync.GAMES_DIR = GAMES_DIR;
   Sync.CURRENT = CURRENT;
+  Sync.TOURNAMENTS = TOURNAMENTS;
   Sync.emptySync = emptySync;
   Sync.parseRepo = parseRepo;
   Sync.b64encode = b64encode;
