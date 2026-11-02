@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>רמי 51</title>
+<meta name="description" content="ניהול ניקוד למשחק רמי 51: מחלק, גלוק, פריש, טבלה ודוחות">
+<meta name="theme-color" content="#1d7a4f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="רמי 51">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="icon-btn" id="btn-back" data-act="back" aria-label="חזרה" hidden>→</button>
+  <h1 data-act="home">רמי 51</h1>
+  <button class="sync-badge" id="sync-badge" data-act="go" data-to="settings" hidden></button>
+</header>
+<main id="view" class="view"></main>
+<div id="overlay-root"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<noscript>האפליקציה צריכה JavaScript כדי לעבוד.</noscript>
+<script src="logic.js"></script>
+<script src="stats.js"></script>
+<script src="sync.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+# Claude conversation files that live in the same folder
+chat_*.html
+*.responses.md

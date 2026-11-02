@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>בדיקות רמי 51</title>
+<style>
+  body { font: 15px/1.5 system-ui, "Segoe UI", Arial, sans-serif; margin: 16px; background: #fff; color: #1c1c1e; }
+  .pass { color: #1d7a4f; }
+  .fail { color: #b42318; font-weight: 700; }
+  #sum { font-size: 1.2rem; font-weight: 700; }
+  li small { display: block; direction: ltr; text-align: left; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<h1>בדיקות לוגיקה, דוחות וסנכרון</h1>
+<p id="sum">רץ…</p>
+<ol id="out"></ol>
+<script src="logic.js"></script>
+<script src="stats.js"></script>
+<script src="sync.js"></script>
+<script>
+(async function () {
+  'use strict';
+  const R = Rummy, ST = RummyStats, SY = RummySync;
+  const tests = [];
+  const test = (name, fn) => tests.push([name, fn]);
+  function eq(actual, expected, msg) {
+    const a = JSON.stringify(actual), e = JSON.stringify(expected);
+    if (a !== e) throw new Error((msg ? msg + ': ' : '') + 'expected ' + e + ', got ' + a);
+  }
+  function ok(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+
+  // pts[k] for every non-winner: a number, or 'X' = did not lay down a set.
+  function play(g, winnerIdx, pts, hand) {
+    const i = R.currentIndex(g);
+    const res = { winnerId: g.players[winnerIdx].id, hand: !!hand, entries: {} };
+    g.players.forEach((p, k) => {
+      if (k === winnerIdx) return;
+      res.entries[p.id] = pts[k] === 'X' ? { noSet: true } : { points: pts[k], noSet: false };
+    });
+    const err = R.validateResult(g, res);
+    if (err) throw new Error(err);
+    R.setResult(g, i, res);
+    return i;
+  }
+  const totalsByName = (g) => { const t = R.totals(g), o = {}; g.players.forEach((p) => { o[p.name] = t[p.id]; }); return o; };
+
+  // ---------------- logic ----------------
+  test('12 תורים, גלוק אוטומטי בתורים 4, 8, 12', () => {
+    const g = R.newGame(['א', 'ב', 'ג', 'ד']);
+    eq(g.rounds.length, 12);
+    eq(g.rounds.map((r, i) => r.gluck ? i + 1 : 0).filter(Boolean), [4, 8, 12]);
+    eq(g.rounds[3].gluckSource, 'auto');
+  });
+
+  test('המחלק מתחלף כל תור, מתחילים מהמחלק הראשון שנבחר', () => {
+    const g = R.newGame(['א', 'ב', 'ג', 'ד'], { firstDealer: 2 });
+    eq([0, 1, 2, 3, 4].map((i) => R.dealer(g, i).name), ['ג', 'ד', 'א', 'ב', 'ג']);
+  });
+
+  test('ניקוד רגיל: מנצח ‎-30, קלפים, ו-100 למי שלא הוריד', () => {
+    const g = R.newGame(['א', 'ב', 'ג', 'ד']);
+    play(g, 0, [0, 10, 'X', 0]);
+    eq(R.roundScores(g, g.rounds[0]), { p1: -30, p2: 10, p3: 100, p4: 0 });
+  });
+
+  test('האנט מכפיל הכול (×2)', () => {
+    const g = R.newGame(['א', 'ב', 'ג', 'ד']);
+    play(g, 0, [0, 10, 'X', 7], true);
+    eq(R.roundScores(g, g.rounds[0]), { p1: -60, p2: 20, p3: 200, p4: 14 });
+  });
+
+  test('גלוק + האנט = ×4', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    play(g, 0, [0, 1, 1]); play(g, 0, [0, 1, 1]); play(g, 0, [0, 1, 1]);
+    play(g, 1, [10, 0, 'X'], true); // round 4 is gluck
+    eq(R.roundScores(g, g.rounds[3]), { p1: 40, p2: -120, p3: 400 });
+  });
+
+  test('סכום מצטבר בכל שורה, ועריכה של תור ישן מעדכנת את הכול', () => {
+    const g = R.newGame(['א', 'ב']);
+    play(g, 0, [0, 20]);
+    play(g, 1, [15, 0]);
+    const t = R.scoreTable(g);
+    eq(t.rows[0].totals, { p1: -30, p2: 20 });
+    eq(t.rows[1].totals, { p1: -15, p2: -10 });
+    R.setResult(g, 0, { winnerId: 'p1', hand: false, entries: { p2: { points: 50, noSet: false } } });
+    eq(R.scoreTable(g).rows[1].totals, { p1: -15, p2: 20 });
+  });
+
+  test('פריש: התור הנוכחי הופך לגלוק והמחלק לא משתנה', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    const before = R.dealer(g, 0).name;
+    const res = R.declareFresh(g);
+    eq(res.gluckIndex, 0);
+    eq(g.rounds[0].gluck, true);
+    eq(g.rounds[0].gluckSource, 'fresh');
+    eq(g.rounds[0].freshCount, 1);
+    eq(R.currentIndex(g), 0, 'still the same round');
+    eq(R.dealer(g, 0).name, before);
+  });
+
+  test('פריש שני באותו תור מעביר את הגלוק לתור הבא', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    R.declareFresh(g);
+    const res = R.declareFresh(g);
+    eq(res.gluckIndex, 1);
+    eq(g.rounds[0].freshCount, 2);
+  });
+
+  test('פריש בתור גלוק מדלג על תורי גלוק עד התור הפנוי הבא', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    R.declareFresh(g); R.declareFresh(g); // rounds 1, 2 gluck
+    play(g, 0, [0, 1, 1]); play(g, 0, [0, 1, 1]); play(g, 0, [0, 1, 1]);
+    eq(R.currentIndex(g), 3);
+    const res = R.declareFresh(g); // round 4 is auto gluck → round 5
+    eq(res.gluckIndex, 4);
+  });
+
+  test('פריש כשכל התורים שנותרו גלוק מבקש להוסיף תור, ותור שנוסף הוא גלוק', () => {
+    const g = R.newGame(['א', 'ב'], { rounds: 4 });
+    play(g, 0, [0, 1]); play(g, 0, [0, 1]); play(g, 0, [0, 1]);
+    const res = R.declareFresh(g);
+    eq(res.needsExtraRound, true);
+    const idx = R.addRound(g, 'fresh');
+    eq(idx, 4);
+    eq(g.rounds[4].gluck, true);
+    eq(g.rounds[4].gluckSource, 'fresh');
+  });
+
+  test('תורים שנוספים ממשיכים את הדפוס: תור 16 גלוק', () => {
+    const g = R.newGame(['א', 'ב']);
+    for (let k = 0; k < 4; k++) R.addRound(g);
+    eq(g.rounds.slice(12).map((r) => r.gluck), [false, false, false, true]);
+  });
+
+  test('גלוק ידני ידליק ויכבה', () => {
+    const g = R.newGame(['א', 'ב']);
+    R.setGluck(g, 1, true);
+    eq([g.rounds[1].gluck, g.rounds[1].gluckSource], [true, 'manual']);
+    R.setGluck(g, 3, false);
+    eq(g.rounds[3].gluck, false);
+  });
+
+  test('בדיקת תקינות של תוצאת תור', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    eq(R.validateResult(g, { winnerId: null, entries: {} }), 'בחר מי ניצח בתור');
+    eq(R.validateResult(g, { winnerId: 'p1', entries: { p2: { points: 5 } } }), 'חסר ניקוד לג');
+    eq(R.validateResult(g, { winnerId: 'p1', entries: { p2: { points: '' }, p3: { noSet: true } } }), 'חסר ניקוד לב');
+    eq(R.validateResult(g, { winnerId: 'p1', entries: { p2: { points: -3 }, p3: { noSet: true } } }), 'חסר ניקוד לב');
+    eq(R.validateResult(g, { winnerId: 'p1', entries: { p2: { points: '0' }, p3: { noSet: true } } }), null);
+  });
+
+  test('סיום מוקדם: נשמרים רק התורים ששוחקו, והמנצח הוא בעל הניקוד הנמוך', () => {
+    const g = R.newGame(['א', 'ב', 'ג']);
+    play(g, 1, [10, 0, 20]); play(g, 1, [5, 0, 5]); play(g, 0, [0, 40, 3]);
+    R.finishGame(g);
+    eq(g.rounds.length, 3);
+    eq([g.endedEarly, g.plannedRounds], [true, 12]);
+    eq(R.playerById(g, g.winnerId).name, 'ב');
+    ok(g.finishedAt, 'finishedAt set');
+  });
+
+  test('תיקו: המנצח שנבחר מקבל מקום ראשון', () => {
+    const g = R.newGame(['א', 'ב', 'ג'], { rounds: 2 });
+    play(g, 0, [0, 10, 50]); play(g, 1, [10, 0, 50]);
+    eq(R.leaders(g).map((p) => p.name), ['א', 'ב']);
+    R.finishGame(g, 'p2');
+    const rank = R.ranking(g);
+    eq(rank.map((r) => [r.player.name, r.place]), [['ב', 1], ['א', 2], ['ג', 3]]);
+  });
+
+  // ---------------- stats ----------------
+  function makeHistory() {
+    const g1 = R.newGame(['A', 'B', 'C'], { rounds: 2 });
+    play(g1, 0, [0, 10, 20]); play(g1, 1, [5, 0, 'X']);
+    R.finishGame(g1); g1.finishedAt = '2025-12-20T20:00:00.000Z';
+    const g2 = R.newGame(['A', 'B', 'C'], { rounds: 2 });
+    play(g2, 0, [0, 15, 'X'], true); play(g2, 1, [40, 0, 10]);
+    R.finishGame(g2); g2.finishedAt = '2026-08-15T20:00:00.000Z';
+    const g3 = R.newGame(['A', 'B', 'C'], { rounds: 2 });
+    play(g3, 1, [50, 0, 5]); play(g3, 2, [30, 0, 0]);
+    R.finishGame(g3); g3.finishedAt = '2026-10-31T20:00:00.000Z';
+    return [g3, g1, g2]; // out of order on purpose
+  }
+
+  test('הניקוד הסופי של משחקי הדוגמה', () => {
+    const [g3, g1, g2] = makeHistory();
+    eq(totalsByName(g1), { A: -25, B: -20, C: 120 });
+    eq(totalsByName(g2), { A: -20, B: 0, C: 210 });
+    eq(totalsByName(g3), { A: 80, B: -30, C: -25 });
+  });
+
+  test('טבלת מנצחים, כלל הנקודות ורצפים', () => {
+    const s = ST.summary(makeHistory());
+    const by = {}; s.players.forEach((p) => { by[p.name] = p; });
+    eq(s.players.map((p) => p.name), ['A', 'B', 'C']);
+    eq([by.A.wins, by.B.wins, by.C.wins], [2, 1, 0]);
+    eq([by.A.totalPoints, by.B.totalPoints, by.C.totalPoints], [35, -50, 305]);
+    eq([by.A.best, by.A.worst], [-25, 80]);
+    eq([by.A.longestStreak, by.A.currentStreak, by.B.currentStreak], [2, 0, 1]);
+    eq(by.A.handWins, 1);
+    eq(by.C.hundreds, 2);
+    eq([by.B.roundsWon, by.B.roundsPlayed], [3, 6]);
+    eq(by.A.avgPlace.toFixed(2), '1.67');
+  });
+
+  test('סטטיסטיקות כלליות', () => {
+    const g = ST.summary(makeHistory()).general;
+    eq([g.games, g.rounds, g.handWins], [3, 6, 1]);
+    eq([g.costliestRound.name, g.costliestRound.points], ['C', 210 - 10]);
+    eq(g.longestStreak, { name: 'A', length: 2 });
+    eq(g.mostWins, { name: 'A', wins: 2 });
+  });
+
+  test('מי ניצח בפעם הקודמת, וסינון לפי תקופה', () => {
+    const h = makeHistory();
+    eq(R.playerById(ST.lastGame(h), ST.lastGame(h).winnerId).name, 'B');
+    const now = new Date('2026-11-01T10:00:00.000Z');
+    eq(ST.filterByPeriod(h, 'all', now).length, 3);
+    eq(ST.filterByPeriod(h, 'year', now).length, 2);
+    eq(ST.filterByPeriod(h, '30d', now).length, 1);
+  });
+
+  test('ראש בראש', () => {
+    eq(ST.headToHead(makeHistory(), 'A', 'B'), { together: 3, a: 2, b: 1, even: 0 });
+  });
+
+  test('איחוד ייבוא לפי מזהה, בלי כפילויות', () => {
+    const [g3, g1, g2] = makeHistory();
+    const older = JSON.parse(JSON.stringify(g1));
+    older.updatedAt = '2000-01-01T00:00:00.000Z';
+    const m = ST.mergeHistory([g1], [older, g2]);
+    eq(m.added, 1);
+    eq(m.games.length, 2);
+    eq(m.games[0].updatedAt, g1.updatedAt, 'the newer copy wins');
+  });
+
+  // ---------------- sync (against a fake GitHub) ----------------
+  function fakeGitHub() {
+    const files = {};
+    let n = 0;
+    const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, text: async () => JSON.stringify(body) });
+    async function handler(url, init) {
+      if (init.headers.Authorization !== 'Bearer good') return resp(401, {});
+      const path = decodeURIComponent(new URL(url).pathname);
+      if (path === '/repos/me/data') return resp(200, { full_name: 'me/data', private: true });
+      const m = /^\/repos\/me\/data\/contents\/(.+)$/.exec(path);
+      if (!m) return resp(404, {});
+      const p = m[1];
+      if (init.method === 'GET') {
+        if (files[p]) return resp(200, { type: 'file', path: p, sha: files[p].sha, content: files[p].content });
+        const prefix = p + '/';
+        const list = Object.keys(files).filter((k) => k.startsWith(prefix) && !k.slice(prefix.length).includes('/'))
+          .map((k) => ({ type: 'file', name: k.slice(prefix.length), path: k, sha: files[k].sha }));
+        return list.length ? resp(200, list) : resp(404, {});
+      }
+      const body = JSON.parse(init.body);
+      if (init.method === 'PUT') {
+        if (files[p] ? body.sha !== files[p].sha : body.sha) return resp(409, {});
+        files[p] = { content: body.content, sha: 's' + (++n) };
+        return resp(200, { content: { sha: files[p].sha } });
+      }
+      if (init.method === 'DELETE') {
+        if (!files[p] || body.sha !== files[p].sha) return resp(409, {});
+        delete files[p];
+        return resp(200, {});
+      }
+      return resp(405, {});
+    }
+    return { files, handler, read: (p) => JSON.parse(SY.b64decode(files[p].content)) };
+  }
+  const CFG = { owner: 'me', repo: 'data', token: 'good' };
+  const newState = () => ({ current: null, history: [], lastPlayers: [], sync: SY.emptySync() });
+
+  test('זיהוי שם המאגר', () => {
+    eq(SY.parseRepo('me/data'), { owner: 'me', repo: 'data' });
+    eq(SY.parseRepo('https://github.com/me/rummy51-data.git'), { owner: 'me', repo: 'rummy51-data' });
+    eq(SY.parseRepo('just-a-name'), null);
+  });
+
+  test('קידוד עברית ל-base64 והחזרה', () => {
+    const s = JSON.stringify({ name: 'שי ✕ 51' });
+    eq(SY.b64decode(SY.b64encode(s)), s);
+  });
+
+  test('טוקן שגוי מחזיר הודעה ברורה', async () => {
+    const gh = fakeGitHub();
+    SY.fetchImpl = gh.handler;
+    let msg = '';
+    try { await SY.check({ owner: 'me', repo: 'data', token: 'bad' }); } catch (e) { msg = e.message; }
+    eq(msg, 'הטוקן לא תקין או שפג תוקפו');
+    eq((await SY.check(CFG)).private, true);
+  });
+
+  test('שמירה: משחק שהסתיים ומשחק פתוח נכתבים לגיט, ואחר כך מתעדכנים ונמחקים', async () => {
+    const gh = fakeGitHub();
+    SY.fetchImpl = gh.handler;
+    const st = newState();
+    const [g3] = makeHistory();
+    st.history.push(g3);
+    st.sync.unsyncedGames.push(g3.id);
+    st.current = R.newGame(['שי', 'דנה']);
+    st.sync.currentVersion = 1;
+    eq(SY.pending(st), 2);
+    await SY.flush(st, CFG);
+    eq(SY.pending(st), 0);
+    eq(gh.read(SY.gamePath(g3)).id, g3.id);
+    eq(gh.read('data/current.json').players[0].name, 'שי');
+
+    play(st.current, 0, [0, 12]);
+    st.sync.currentVersion++;
+    await SY.flush(st, CFG);
+    eq(R.playedCount(gh.read('data/current.json')), 1, 'current updated over existing sha');
+
+    st.current = null;
+    st.sync.currentVersion++;
+    st.sync.deletedGames.push(SY.gamePath(g3));
+    await SY.flush(st, CFG);
+    eq(Object.keys(gh.files), []);
+  });
+
+  test('טלפון חדש מושך את כל המשחקים והמשחק הפתוח מגיט', async () => {
+    const gh = fakeGitHub();
+    SY.fetchImpl = gh.handler;
+    const a = newState();
+    a.history = makeHistory();
+    a.sync.unsyncedGames = a.history.map((g) => g.id);
+    a.current = R.newGame(['שי', 'דנה']);
+    a.sync.currentVersion = 1;
+    await SY.flush(a, CFG);
+
+    const b = newState();
+    const local = R.finishGame((() => { const g = R.newGame(['X', 'Y'], { rounds: 1 }); play(g, 0, [0, 5]); return g; })());
+    b.history.push(local);
+    const res = await SY.pull(b, CFG);
+    eq(res.added, 3);
+    eq(b.history.length, 4);
+    eq(res.remoteCurrent.id, a.current.id);
+    eq(b.sync.unsyncedGames, [local.id], 'a game only on this phone is queued for upload');
+    ok(b.history.every((g, i, arr) => !i || arr[i - 1].finishedAt <= g.finishedAt), 'history sorted by date');
+  });
+
+  test('שינוי במשחק בזמן שמירה לא הולך לאיבוד', async () => {
+    const gh = fakeGitHub();
+    const st = newState();
+    st.current = R.newGame(['שי', 'דנה']);
+    st.sync.currentVersion = 1;
+    SY.fetchImpl = async (url, init) => {
+      if (init.method === 'PUT') st.sync.currentVersion++; // a change lands while the request is in flight
+      return gh.handler(url, init);
+    };
+    await SY.flush(st, CFG);
+    eq(SY.pending(st), 1, 'the newer version is still pending');
+  });
+
+  // ---------------- run ----------------
+  const out = document.getElementById('out');
+  let pass = 0;
+  const failures = [];
+  for (const [name, fn] of tests) {
+    const li = document.createElement('li');
+    try {
+      await fn();
+      pass++;
+      li.className = 'pass';
+      li.textContent = '✓ ' + name;
+    } catch (e) {
+      failures.push(name + ': ' + e.message);
+      li.className = 'fail';
+      li.textContent = '✗ ' + name;
+      const small = document.createElement('small');
+      small.textContent = e.message;
+      li.appendChild(small);
+    }
+    out.appendChild(li);
+  }
+  SY.fetchImpl = null;
+  const sum = document.getElementById('sum');
+  sum.textContent = failures.length ? `${failures.length} נכשלו, ${pass} עברו` : `כל ${pass} הבדיקות עברו`;
+  sum.className = failures.length ? 'fail' : 'pass';
+  window.testResults = { pass, fail: failures.length, failures };
+})();
+</script>
+</body>
+</html>
