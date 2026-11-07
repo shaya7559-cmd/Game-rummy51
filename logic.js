@@ -1,5 +1,13 @@
 /* Rummy 51 — game rules. Pure functions, no DOM.
-   A game stores only what was entered; scores are always recomputed from it. */
+   A tournament has participants and games; everyone plays every game. A game is 12 rounds (or as many as chosen).
+   Tournament = { id, name, createdAt, updatedAt, metaAt, archived?, deleted?,
+                  players: [{ id, name, at }]   seat order
+                  games: [Game]                 in order of play; at most one open game (no finishedAt), always last
+                  removed?: [gameId] }          deleted games, so the deletion reaches other phones
+   Game = { id, tournamentId, createdAt, updatedAt, players: [{ id, name }], firstDealer, rounds,
+            finishedAt?, winnerId?, plannedRounds?, endedEarly? }
+   A game stores only what was entered; scores are always recomputed from it.
+   metaAt = when the name, archived or deleted state last changed (used when merging copies). */
 (function (root) {
   'use strict';
 
@@ -30,7 +38,8 @@
     return { gluck: auto, gluckSource: auto ? 'auto' : null, freshCount: 0, result: null };
   }
 
-  function newGame(names, opts) {
+  // players: names (ids p1, p2…) or { id, name } objects (a tournament's participants).
+  function newGame(players, opts) {
     opts = opts || {};
     var count = opts.rounds || DEFAULT_ROUNDS;
     var rounds = [];
@@ -40,7 +49,9 @@
       id: uid(),
       createdAt: t,
       updatedAt: t,
-      players: names.map(function (name, i) { return { id: 'p' + (i + 1), name: cleanName(name) }; }),
+      players: players.map(function (x, i) {
+        return typeof x === 'string' ? { id: 'p' + (i + 1), name: cleanName(x) } : { id: x.id, name: cleanName(x.name) };
+      }),
       firstDealer: opts.firstDealer || 0,
       rounds: rounds
     };
@@ -228,6 +239,170 @@
     return game;
   }
 
+  // After a finished game is corrected: the winner stays when they still have the lowest total.
+  // Returns the players tied for the lowest total when someone has to choose, otherwise null.
+  function refreshWinner(game) {
+    var lead = leaders(game);
+    if (lead.some(function (p) { return p.id === game.winnerId; })) return null;
+    if (lead.length === 1) {
+      game.winnerId = lead[0].id;
+      return null;
+    }
+    return lead;
+  }
+
+  // ---------- tournaments ----------
+  function newTournament(name, names) {
+    var t = now();
+    return {
+      id: uid(), name: cleanName(name), createdAt: t, updatedAt: t, metaAt: t,
+      players: names.map(function (n, i) { return { id: 'p' + (i + 1), name: cleanName(n), at: t }; }),
+      games: []
+    };
+  }
+
+  function touchTour(tour, game) {
+    var t = now();
+    if (game) game.updatedAt = t;
+    tour.updatedAt = t;
+  }
+
+  function touchMeta(tour) {
+    tour.metaAt = tour.updatedAt = now();
+  }
+
+  function byFinish(a, b) {
+    return a.finishedAt.localeCompare(b.finishedAt);
+  }
+
+  function finishedGames(tour) {
+    return tour.games.filter(function (g) { return g.finishedAt; }).sort(byFinish);
+  }
+
+  function openGame(tour) {
+    for (var i = 0; i < tour.games.length; i++) if (!tour.games[i].finishedAt) return tour.games[i];
+    return null;
+  }
+
+  function findTourGame(tour, id) {
+    for (var i = 0; i < tour.games.length; i++) if (tour.games[i].id === id) return tour.games[i];
+    return null;
+  }
+
+  // The next game, with every participant. opts = { rounds, firstDealer } (firstDealer = a seat).
+  function startGame(tour, opts) {
+    var g = newGame(tour.players, opts);
+    g.tournamentId = tour.id;
+    tour.games.push(g);
+    touchTour(tour);
+    return g;
+  }
+
+  // The seat after the one who dealt first in the previous game.
+  function nextFirstDealer(tour) {
+    var last = tour.games[tour.games.length - 1];
+    if (!last) return 0;
+    var first = last.players[last.firstDealer || 0];
+    for (var i = 0; first && i < tour.players.length; i++) {
+      if (tour.players[i].id === first.id) return (i + 1) % tour.players.length;
+    }
+    return 0;
+  }
+
+  // Deleted games are remembered by id, so a copy from another phone does not bring them back.
+  function removeGame(tour, id) {
+    tour.removed = tour.removed || [];
+    if (tour.removed.indexOf(id) < 0) tour.removed.push(id);
+    tour.games = tour.games.filter(function (g) { return g.id !== id; });
+    touchTour(tour);
+  }
+
+  // Finished games in order, then at most one open game (the one changed last), without deleted games.
+  function normalize(tour) {
+    var removed = {};
+    (tour.removed || []).forEach(function (id) { removed[id] = true; });
+    var games = (tour.games || []).filter(function (g) { return g && g.id && Array.isArray(g.rounds) && !removed[g.id]; });
+    var done = games.filter(function (g) { return g.finishedAt; }).sort(byFinish);
+    var open = games.filter(function (g) { return !g.finishedAt; })
+      .sort(function (a, b) { return (a.updatedAt || '').localeCompare(b.updatedAt || ''); });
+    tour.games = done.concat(open.slice(-1));
+    tour.games.forEach(function (g) { g.tournamentId = tour.id; });
+    tour.players = tour.players || [];
+    return tour;
+  }
+
+  // One row per participant over the given finished games, best first:
+  // fewest points, then more game wins. Equal points and wins share a place.
+  function tally(players, games) {
+    var rows = players.map(function (p, seat) { return { player: p, seat: seat, total: 0, wins: 0, games: 0, place: 0 }; });
+    var by = {};
+    rows.forEach(function (r) { by[r.player.id] = r; });
+    games.forEach(function (g) {
+      var t = totals(g);
+      g.players.forEach(function (p) {
+        var r = by[p.id];
+        if (!r) return;
+        r.total += t[p.id];
+        r.games++;
+        if (p.id === g.winnerId) r.wins++;
+      });
+    });
+    rows.sort(function (a, b) { return a.total - b.total || b.wins - a.wins || a.seat - b.seat; });
+    rows.forEach(function (r, i) {
+      var prev = rows[i - 1];
+      r.place = prev && prev.total === r.total && prev.wins === r.wins ? prev.place : i + 1;
+    });
+    return rows;
+  }
+
+  // The tournament table. total = finished games only, so places change only when a game ends.
+  // game = points in the open game (null when there is none). exceptId leaves one finished game out.
+  function standings(tour, exceptId) {
+    var done = finishedGames(tour).filter(function (g) { return g.id !== exceptId; });
+    var rows = tally(tour.players, done);
+    var open = openGame(tour);
+    var t = open ? totals(open) : null;
+    rows.forEach(function (r) { r.game = t && r.player.id in t ? t[r.player.id] : null; });
+    return rows;
+  }
+
+  // How many places each participant moved when the last game ended (+ = up). Empty before the second game.
+  function placeMoves(tour) {
+    var done = finishedGames(tour);
+    if (done.length < 2) return {};
+    var before = {};
+    standings(tour, done[done.length - 1].id).forEach(function (r) { before[r.player.id] = r.place; });
+    var out = {};
+    standings(tour).forEach(function (r) { out[r.player.id] = before[r.player.id] - r.place; });
+    return out;
+  }
+
+  function tourLeaders(tour) {
+    if (!finishedGames(tour).length) return [];
+    return standings(tour).filter(function (r) { return r.place === 1; }).map(function (r) { return r.player; });
+  }
+
+  // A readable digest saved in the git file next to the raw data (the app never reads it back).
+  function digest(tour) {
+    function named(t, g) {
+      var o = {};
+      g.players.forEach(function (p) { o[p.name] = t[p.id]; });
+      return o;
+    }
+    var open = openGame(tour);
+    return {
+      participants: tour.players.map(function (p) { return p.name; }),
+      standings: standings(tour).map(function (r) {
+        return { place: r.place, name: r.player.name, total: r.total, wins: r.wins, games: r.games };
+      }),
+      games: finishedGames(tour).map(function (g, i) {
+        var w = playerById(g, g.winnerId);
+        return { number: i + 1, id: g.id, finishedAt: g.finishedAt, rounds: g.rounds.length, winner: w ? w.name : null, totals: named(totals(g), g) };
+      }),
+      openGame: open ? { id: open.id, roundsPlayed: playedCount(open), rounds: open.rounds.length, totals: named(totals(open), open) } : null
+    };
+  }
+
   var Rummy = {
     WIN_POINTS: WIN_POINTS,
     NO_SET_POINTS: NO_SET_POINTS,
@@ -257,7 +432,24 @@
     validateResult: validateResult,
     setResult: setResult,
     clearResult: clearResult,
-    finishGame: finishGame
+    finishGame: finishGame,
+    refreshWinner: refreshWinner,
+    now: now,
+    newTournament: newTournament,
+    touchTour: touchTour,
+    touchMeta: touchMeta,
+    finishedGames: finishedGames,
+    openGame: openGame,
+    findTourGame: findTourGame,
+    startGame: startGame,
+    nextFirstDealer: nextFirstDealer,
+    removeGame: removeGame,
+    normalize: normalize,
+    tally: tally,
+    standings: standings,
+    placeMoves: placeMoves,
+    tourLeaders: tourLeaders,
+    digest: digest
   };
 
   root.Rummy = Rummy;
