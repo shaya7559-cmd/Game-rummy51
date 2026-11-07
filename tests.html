@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<h1>בדיקות לוגיקה, דוחות וסנכרון</h1>
+<h1>בדיקות לוגיקה, טורנירים, דוחות וסנכרון</h1>
 <p id="sum">רץ…</p>
 <ol id="out"></ol>
 <script src="logic.js"></script>
@@ -228,16 +228,6 @@
     eq(ST.headToHead(makeHistory(), 'A', 'B'), { together: 3, a: 2, b: 1, even: 0 });
   });
 
-  test('איחוד ייבוא לפי מזהה, בלי כפילויות', () => {
-    const [g3, g1, g2] = makeHistory();
-    const older = JSON.parse(JSON.stringify(g1));
-    older.updatedAt = '2000-01-01T00:00:00.000Z';
-    const m = ST.mergeHistory([g1], [older, g2]);
-    eq(m.added, 1);
-    eq(m.games.length, 2);
-    eq(m.games[0].updatedAt, g1.updatedAt, 'the newer copy wins');
-  });
-
   // ---------------- sync (against a fake GitHub) ----------------
   function fakeGitHub() {
     const files = {};
@@ -273,7 +263,9 @@
     return { files, handler, read: (p) => JSON.parse(SY.b64decode(files[p].content)) };
   }
   const CFG = { owner: 'me', repo: 'data', token: 'good' };
-  const newState = () => ({ current: null, history: [], lastPlayers: [], sync: SY.emptySync() });
+  const TT = RummyTournaments;
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const newState = () => ({ tournaments: [], activeId: null, sync: Object.assign(SY.emptySync(), { legacyDone: true }) });
 
   test('זיהוי שם המאגר', () => {
     eq(SY.parseRepo('me/data'), { owner: 'me', repo: 'data' });
@@ -295,173 +287,266 @@
     eq((await SY.check(CFG)).private, true);
   });
 
-  test('שמירה: משחק שהסתיים ומשחק פתוח נכתבים לגיט, ואחר כך מתעדכנים ונמחקים', async () => {
-    const gh = fakeGitHub();
-    SY.fetchImpl = gh.handler;
-    const st = newState();
-    const [g3] = makeHistory();
-    st.history.push(g3);
-    st.sync.unsyncedGames.push(g3.id);
-    st.current = R.newGame(['שי', 'דנה']);
-    st.sync.currentVersion = 1;
-    eq(SY.pending(st), 2);
-    await SY.flush(st, CFG);
-    eq(SY.pending(st), 0);
-    eq(gh.read(SY.gamePath(g3)).id, g3.id);
-    eq(gh.read('data/current.json').players[0].name, 'שי');
+  // ---------------- tournaments ----------------
+  // games[k] = the rounds of game k: [winnerIdx, pts, hand?] each.
+  function tourWith(names, games) {
+    const t = R.newTournament('בית', names);
+    games.forEach((rounds, k) => {
+      const g = R.startGame(t, { rounds: rounds.length });
+      rounds.forEach(([w, pts, hand]) => play(g, w, pts, hand));
+      R.finishGame(g);
+      g.finishedAt = '2026-01-0' + (k + 1) + 'T20:00:00.000Z';
+    });
+    return t;
+  }
 
-    play(st.current, 0, [0, 12]);
-    st.sync.currentVersion++;
-    await SY.flush(st, CFG);
-    eq(R.playedCount(gh.read('data/current.json')), 1, 'current updated over existing sha');
-
-    st.current = null;
-    st.sync.currentVersion++;
-    st.sync.deletedGames.push(SY.gamePath(g3));
-    await SY.flush(st, CFG);
-    eq(Object.keys(gh.files), []);
+  test('הרכב: אותם משתתפים בכל סדר ישיבה הם אותו הרכב', () => {
+    eq(TT.lineupKey(['ב', 'א', 'ג']), TT.lineupKey(['ג', ' א ', 'ב']));
+    ok(TT.lineupKey(['א', 'ב']) !== TT.lineupKey(['א', 'ב', 'ג']), 'a different lineup');
+    eq(TT.defaultName(['אבא', ' דני', 'רון']), 'אבא · דני · רון');
+    const t = R.newTournament('', ['א', 'ב']);
+    eq(TT.findByLineup([t], ['ב', 'א']).id, t.id);
+    t.archived = true;
+    eq(TT.findByLineup([t], ['ב', 'א']), null, 'a tournament in the archive is not offered');
   });
 
-  test('טלפון חדש מושך את כל המשחקים והמשחק הפתוח מגיט', async () => {
+  test('טורניר: כל המשתתפים בכל משחק, והמחלק הראשון עובר הלאה', () => {
+    const t = R.newTournament('', ['א', 'ב', 'ג']);
+    const g = R.startGame(t, { firstDealer: 1 });
+    eq(g.players.map((p) => p.id), t.players.map((p) => p.id));
+    eq(g.tournamentId, t.id);
+    ok(R.openGame(t) === g, 'the new game is the open game');
+    eq(R.dealer(g, 0).name, 'ב');
+    eq(R.nextFirstDealer(t), 2);
+    play(g, 0, [0, 5, 5]);
+    R.finishGame(g);
+    eq(R.openGame(t), null);
+    eq(R.finishedGames(t).length, 1);
+  });
+
+  test('טבלת הטורניר: הכי מעט נקודות ראשון, והמקומות זזים רק בסוף משחק', () => {
+    // game 1: A -30, B 10, C 50 · game 2: A 20, B -30, C 5
+    const t = tourWith(['A', 'B', 'C'], [[[0, [0, 10, 50]]], [[1, [20, 0, 5]]]]);
+    eq(R.standings(t).map((r) => [r.player.name, r.total, r.wins, r.place]), [['B', -20, 1, 1], ['A', -10, 1, 2], ['C', 55, 0, 3]]);
+    const mv = R.placeMoves(t);
+    eq([mv.p1, mv.p2, mv.p3], [-1, 1, 0], 'places moved when game 2 ended');
+    eq(R.tourLeaders(t).map((p) => p.name), ['B']);
+    const g = R.startGame(t, {});
+    play(g, 2, [40, 40, 0]);
+    const rows = R.standings(t);
+    eq(rows.map((r) => r.player.name), ['B', 'A', 'C'], 'the open game does not move anyone');
+    eq(rows.map((r) => r.game), [40, 40, -30]);
+  });
+
+  test('שוויון בנקודות: מי שניצח ביותר משחקים, ובלי הבדל — אותו מקום', () => {
+    const t = tourWith(['A', 'B', 'C'], [[[0, [0, 20, 50]]], [[0, [0, 0, 30]]], [[2, [80, 0, 0]]]]);
+    eq(R.standings(t).map((r) => [r.player.name, r.total, r.wins, r.place]), [['A', 20, 2, 1], ['B', 20, 0, 2], ['C', 50, 1, 3]]);
+    const even = tourWith(['A', 'B'], [[[0, [0, 30]]], [[1, [30, 0]]]]);
+    eq(R.standings(even).map((r) => r.place), [1, 1]);
+    eq(R.tourLeaders(even).length, 2);
+  });
+
+  test('תיקון תור במשחק שהסתיים: הניקוד בטורניר והמנצח מתעדכנים', () => {
+    const t = tourWith(['A', 'B'], [[[0, [0, 10]], [1, [5, 0]]]]); // A -25, B -20
+    const g = R.finishedGames(t)[0];
+    eq(R.playerById(g, g.winnerId).name, 'A');
+    R.setResult(g, 1, { winnerId: 'p2', hand: true, entries: { p1: { points: 5 } } }); // A -20, B -50
+    eq(R.refreshWinner(g), null);
+    eq(R.playerById(g, g.winnerId).name, 'B');
+    eq(R.standings(t).map((r) => [r.player.name, r.total]), [['B', -50], ['A', -20]]);
+
+    const h = R.newGame(['A', 'B', 'C'], { rounds: 2 });
+    play(h, 0, [0, 30, 30]); play(h, 1, [30, 0, 0]); // A 0, B 0, C 30
+    R.finishGame(h, 'p1');
+    R.setResult(h, 1, { winnerId: 'p3', hand: false, entries: { p1: { points: 30 }, p2: { points: 30 } } }); // A 0, B 60, C 0
+    eq(R.refreshWinner(h), null, 'the winner is still tied for the lowest total');
+    eq(h.winnerId, 'p1');
+    R.setResult(h, 0, { winnerId: 'p2', hand: false, entries: { p1: { points: 0 }, p3: { points: 30 } } }); // A 30, B 0, C 0
+    eq(R.refreshWinner(h).map((p) => p.name), ['B', 'C'], 'a tie without the winner: someone chooses');
+  });
+
+  test('תקציר קריא לקובץ: טבלה, ניקוד כל משחק והמשחק הפתוח', () => {
+    const t = tourWith(['שי', 'דנה'], [[[0, [0, 12]]]]);
+    const g = R.startGame(t, {});
+    play(g, 1, [8, 0]);
+    const d = R.digest(t);
+    eq(d.participants, ['שי', 'דנה']);
+    eq(d.standings, [{ place: 1, name: 'שי', total: -30, wins: 1, games: 1 }, { place: 2, name: 'דנה', total: 12, wins: 0, games: 1 }]);
+    eq([d.games[0].number, d.games[0].winner, d.games[0].totals], [1, 'שי', { 'שי': -30, 'דנה': 12 }]);
+    eq([d.openGame.roundsPlayed, d.openGame.totals], [1, { 'שי': 8, 'דנה': -30 }]);
+  });
+
+  test('מחיקת משחק נשמרת גם אחרי איחוד עם עותק שעוד יש בו את המשחק', () => {
+    const t = tourWith(['A', 'B'], [[[0, [0, 10]]], [[1, [10, 0]]]]);
+    const copy = clone(t);
+    R.removeGame(t, R.finishedGames(t)[0].id);
+    const m = TT.mergeTournament(t, copy);
+    eq(m.tournament.games.length, 1);
+    eq([m.changed, m.ahead], [false, true]);
+  });
+
+  test('איחוד שני טלפונים: כל משחק מהעותק שעודכן אחרון, והשם מהשינוי האחרון', () => {
+    const base = tourWith(['A', 'B'], [[[0, [0, 10]]]]);
+    base.metaAt = R.finishedGames(base)[0].updatedAt = '2026-01-01T00:00:00.000Z'; // older than the changes below
+    const a = clone(base), b = clone(base);
+    const g = R.startGame(a, {});
+    play(g, 0, [0, 5]);
+    g.updatedAt = '2026-02-01T00:00:00.000Z';
+    b.name = 'שם חדש';
+    b.metaAt = '2026-02-02T00:00:00.000Z';
+    R.finishedGames(b)[0].rounds[0].result.entries.p2.points = 15; // corrected on phone b
+    R.finishedGames(b)[0].updatedAt = '2026-02-03T00:00:00.000Z';
+    const m = TT.mergeTournament(a, b);
+    eq(m.tournament.name, 'שם חדש');
+    eq(R.playedCount(R.openGame(m.tournament)), 1);
+    eq(R.totals(R.finishedGames(m.tournament)[0]).p2, 15);
+    eq([m.changed, m.ahead], [true, true]);
+    eq(TT.sig(TT.mergeTournament(b, a).tournament), TT.sig(m.tournament), 'both phones end with the same copy');
+  });
+
+  test('המרה מהגרסה הקודמת: כל משחק עובר לטורניר שלו, והמשתתפים מותאמים לפי השם', () => {
+    const g1 = R.newGame(['A', 'B', 'C'], { rounds: 1 });
+    play(g1, 0, [0, 10, 20]); R.finishGame(g1);
+    Object.assign(g1, { finishedAt: '2026-01-01T20:00:00.000Z', tournamentId: 'x1', tournamentName: 'בית' });
+    const g2 = R.newGame(['C', 'A', 'B'], { rounds: 1 }); // another seating order
+    play(g2, 0, [0, 5, 7]); R.finishGame(g2);
+    Object.assign(g2, { finishedAt: '2026-01-02T20:00:00.000Z', tournamentId: 'x1' });
+    const cur = R.newGame(['B', 'C', 'A']);
+    play(cur, 1, [3, 0, 4]);
+    cur.tournamentId = 'x1';
+    const other = R.newGame(['A', 'D'], { rounds: 1 });
+    play(other, 1, [9, 0]); R.finishGame(other);
+    other.finishedAt = '2026-01-03T20:00:00.000Z';
+    const old = { history: [g2, g1, other], current: cur, tournaments: [{ id: 'x1', name: 'בית', createdAt: '2025-12-31T00:00:00.000Z', updatedAt: '2025-12-31T00:00:00.000Z' }] };
+    const list = TT.fromV1(old);
+    eq(list.map((t) => t.name), ['בית', 'A · D']);
+    const t = list[0];
+    eq(t.players.map((p) => p.name), ['A', 'B', 'C']);
+    eq(R.finishedGames(t).length, 2);
+    eq(R.playedCount(R.openGame(t)), 1, 'the open game moves too');
+    eq(R.standings(t).map((r) => [r.player.name, r.total, r.wins]), [['A', -25, 1], ['C', -10, 1], ['B', 17, 0]]);
+    eq(TT.sig(TT.fromV1(old)[0]), TT.sig(t), 'the same data gets the same ids on every phone');
+  });
+
+  test('העברת מזהי משתתפים במשחק (העברה לטורניר אחר)', () => {
+    const g = R.newGame(['A', 'B'], { rounds: 1 });
+    play(g, 1, [7, 0]);
+    const m = TT.remapGame(g, { p1: 'n1', p2: 'n2' });
+    eq(m.players.map((p) => p.id), ['n1', 'n2']);
+    eq(m.rounds[0].result.winnerId, 'n2');
+    eq(Object.keys(m.rounds[0].result.entries), ['n1']);
+    eq(R.totals(m), { n1: 7, n2: -30 });
+  });
+
+  test('סקירת טורנירים: המוביל הוא מי שצבר הכי מעט נקודות', () => {
+    // A: -30 +10 +10 = -10 (1 win) · B: 50 -30 -30 = -10 (2 wins)
+    const t = tourWith(['A', 'B'], [[[0, [0, 50]]], [[1, [10, 0]]], [[1, [10, 0]]]]);
+    const row = TT.overview([t])[0];
+    eq([row.games, row.leaders.map((l) => l.player.name)], [3, ['B']]);
+    const gone = TT.tombstone(R.newTournament('', ['X', 'Y']));
+    eq(TT.overview([t, gone]).length, 1);
+    eq(TT.allGames([t, gone]).length, 3);
+    ok(TT.findGame([t], R.finishedGames(t)[1].id).tour === t, 'a game is found with its tournament');
+    eq(ST.filterByTournament(TT.allGames([t]), t.id).length, 3);
+  });
+
+  // ---------------- sync (against a fake GitHub) ----------------
+  test('גיט: קובץ לכל טורניר עם תקציר קריא, וטלפון חדש מקבל הכול', async () => {
     const gh = fakeGitHub();
     SY.fetchImpl = gh.handler;
     const a = newState();
-    a.history = makeHistory();
-    a.sync.unsyncedGames = a.history.map((g) => g.id);
-    a.current = R.newGame(['שי', 'דנה']);
-    a.sync.currentVersion = 1;
+    const t = tourWith(['שי', 'דנה'], [[[0, [0, 12]]]]);
+    R.startGame(t, {});
+    a.tournaments.push(t);
+    SY.markDirty(a, t.id);
+    eq(SY.pending(a), 1);
     await SY.flush(a, CFG);
+    eq(SY.pending(a), 0);
+    const file = gh.read(SY.tournamentPath(t.id));
+    eq(file.summary.standings.map((r) => [r.name, r.total]), [['שי', -30], ['דנה', 12]]);
+    eq(file.summary.games[0].winner, 'שי');
+    eq(file.summary.openGame.roundsPlayed, 0);
+    eq(file.games.length, 2);
 
     const b = newState();
-    const local = R.finishGame((() => { const g = R.newGame(['X', 'Y'], { rounds: 1 }); play(g, 0, [0, 5]); return g; })());
-    b.history.push(local);
     const res = await SY.pull(b, CFG);
-    eq(res.added, 3);
-    eq(b.history.length, 4);
-    eq(res.remoteCurrent.id, a.current.id);
-    eq(b.sync.unsyncedGames, [local.id], 'a game only on this phone is queued for upload');
-    ok(b.history.every((g, i, arr) => !i || arr[i - 1].finishedAt <= g.finishedAt), 'history sorted by date');
+    eq(res.added, 1);
+    eq(b.tournaments[0].summary, undefined, 'the digest is not kept on the phone');
+    eq(TT.sig(b.tournaments[0]), TT.sig(t));
+    eq(SY.pending(b), 0);
   });
 
-  test('שינוי במשחק בזמן שמירה לא הולך לאיבוד', async () => {
+  test('גיט: שני טלפונים שומרים את אותו טורניר, ושום שינוי לא הולך לאיבוד', async () => {
+    const gh = fakeGitHub();
+    SY.fetchImpl = gh.handler;
+    const a = newState();
+    const t = tourWith(['A', 'B'], [[[0, [0, 10]]]]);
+    t.metaAt = '2026-01-01T00:00:00.000Z'; // older than the rename below
+    a.tournaments.push(t);
+    SY.markDirty(a, t.id);
+    await SY.flush(a, CFG);
+    const b = newState();
+    await SY.pull(b, CFG);
+    const tb = b.tournaments[0];
+    const g = R.startGame(tb, {});
+    play(g, 1, [7, 0]);
+    SY.markDirty(b, tb.id);
+    await SY.flush(b, CFG);
+    const ta = a.tournaments[0];
+    ta.name = 'אצל סבתא';
+    R.touchMeta(ta);
+    SY.markDirty(a, ta.id);
+    await SY.flush(a, CFG); // the file changed since phone a saw it: merged, then saved
+    const file = gh.read(SY.tournamentPath(t.id));
+    eq(file.name, 'אצל סבתא');
+    eq(R.playedCount(file.games[1]), 1);
+    eq(R.playedCount(R.openGame(a.tournaments[0])), 1, 'phone a got the game from phone b');
+  });
+
+  test('שינוי בטורניר בזמן שמירה נשאר ממתין', async () => {
     const gh = fakeGitHub();
     const st = newState();
-    st.current = R.newGame(['שי', 'דנה']);
-    st.sync.currentVersion = 1;
+    const t = R.newTournament('', ['A', 'B']);
+    st.tournaments.push(t);
+    SY.markDirty(st, t.id);
     SY.fetchImpl = async (url, init) => {
-      if (init.method === 'PUT') st.sync.currentVersion++; // a change lands while the request is in flight
+      if (init.method === 'PUT') SY.markDirty(st, t.id); // a change lands while the request is in flight
       return gh.handler(url, init);
     };
     await SY.flush(st, CFG);
     eq(SY.pending(st), 1, 'the newer version is still pending');
   });
 
-  // ---------------- tournaments ----------------
-  const TT = RummyTournaments;
-  function finishedGame(names, tournamentId, finishedAt, winnerIdx, pts) {
-    const g = R.newGame(names, { rounds: 1 });
-    play(g, winnerIdx || 0, pts || names.map((n, k) => (k === (winnerIdx || 0) ? 0 : 10)));
-    R.finishGame(g);
-    g.finishedAt = finishedAt;
-    if (tournamentId) g.tournamentId = tournamentId;
-    return g;
-  }
-
-  test('הרכב: אותם שחקנים בכל סדר ישיבה הם אותו הרכב', () => {
-    eq(TT.lineupKey(['ב', 'א', 'ג']), TT.lineupKey(['ג', ' א ', 'ב']));
-    ok(TT.lineupKey(['א', 'ב']) !== TT.lineupKey(['א', 'ב', 'ג']), 'a different lineup');
-    eq(TT.defaultName(['אבא', ' דני', 'רון']), 'אבא · דני · רון');
-  });
-
-  test('בחירת טורניר: הטורניר האחרון של ההרכב, ובלי ארכיון', () => {
-    const t1 = TT.make('א · ב · ג', TT.lineupKey(['א', 'ב', 'ג']));
-    const t2 = TT.make('אצל סבתא', null);
-    const list = [t1, t2];
-    const games = [
-      finishedGame(['א', 'ב', 'ג'], t2.id, '2026-03-01T20:00:00.000Z'),
-      finishedGame(['ג', 'א', 'ב'], t1.id, '2025-03-01T20:00:00.000Z')
-    ];
-    eq(TT.suggest(list, games, ['ב', 'ג', 'א']).id, t2.id, 'the lineup played last in t2');
-    eq(TT.suggest(list, games, ['א', 'ב', 'ד']), null, 'a new lineup gets a new tournament');
-    t2.archived = true;
-    eq(TT.suggest(list, games, ['א', 'ב', 'ג']).id, t1.id, 'archived tournaments are not offered');
-    const t3 = TT.make('א · ב', TT.lineupKey(['א', 'ב']));
-    list.push(t3);
-    eq(TT.suggest(list, games, ['ב', 'א']).id, t3.id, 'a tournament opened for the lineup, before its first game');
-  });
-
-  test('משחקים מלפני הטורנירים מתחלקים לטורנירים לפי ההרכב', () => {
-    const games = [
-      finishedGame(['A', 'B', 'C'], null, '2026-01-01T20:00:00.000Z'),
-      finishedGame(['C', 'B', 'A'], null, '2026-01-02T20:00:00.000Z'),
-      finishedGame(['A', 'B'], null, '2026-01-03T20:00:00.000Z')
-    ];
-    const list = [];
-    const res = TT.ensure(list, games);
-    eq(res.games.length, 3);
-    eq(res.tournaments, true);
-    eq(list.map((t) => t.name), ['A · B · C', 'A · B']);
-    eq(games[0].tournamentId, games[1].tournamentId);
-    ok(games[2].tournamentId !== games[0].tournamentId, 'a different lineup, a different tournament');
-    eq(games[0].tournamentName, 'A · B · C');
-    eq(TT.ensure(list, games), { games: [], tournaments: false }, 'nothing left to fix');
-  });
-
-  test('טורניר שמוכר רק מתוך משחק נבנה מחדש, וטורניר מחוק עם משחק חוזר', () => {
-    const g = finishedGame(['A', 'B'], 'x1', '2026-01-01T20:00:00.000Z');
-    g.tournamentName = 'אצל סבתא';
-    const list = [];
-    eq(TT.ensure(list, [g]).tournaments, true);
-    eq([list[0].id, list[0].name], ['x1', 'אצל סבתא']);
-    list[0].deleted = true;
-    TT.ensure(list, [g]);
-    eq(list[0].deleted, false);
-  });
-
-  test('איחוד רשימות טורנירים: העדכון האחרון גובר', () => {
-    const a = { id: 'a', name: 'ישן', createdAt: '1', updatedAt: '2026-01-01' };
-    const b = { id: 'b', name: 'רק כאן', createdAt: '2', updatedAt: '2026-01-01' };
-    const a2 = { id: 'a', name: 'חדש', createdAt: '1', updatedAt: '2026-02-01' };
-    const c = { id: 'c', name: 'רק שם', createdAt: '3', updatedAt: '2026-01-01' };
-    const m = TT.merge([a, b], [a2, c]);
-    eq(m.list.map((t) => t.name), ['חדש', 'רק כאן', 'רק שם']);
-    eq([m.changed, m.ahead], [true, true]);
-    const same = TT.merge([a2, c], [a2, c]);
-    eq([same.changed, same.ahead], [false, false]);
-  });
-
-  test('מוביל הטורניר: הכי הרבה ניצחונות, ובשוויון פחות נקודות', () => {
-    const t = TT.make('בית', null);
-    const g1 = finishedGame(['A', 'B'], t.id, '2026-01-01T20:00:00.000Z', 0, [0, 50]); // A -30, B 50
-    const g2 = finishedGame(['A', 'B'], t.id, '2026-01-02T20:00:00.000Z', 1, [10, 0]); // A 10, B -30
-    const other = finishedGame(['A', 'B'], 'elsewhere', '2026-01-03T20:00:00.000Z', 1, [10, 0]);
-    const games = [g1, g2, other];
-    eq(ST.summary(ST.filterByTournament(games, t.id)).players.map((p) => [p.name, p.wins, p.totalPoints]), [['A', 1, -20], ['B', 1, 20]]);
-    const row = TT.overview([t], games)[0];
-    eq([row.games, row.leader.name, row.lastAt], [2, 'A', g2.finishedAt]);
-    eq(ST.filterByTournament(games, 'all').length, 3);
-  });
-
-  test('הטורנירים נשמרים בגיט ונטענים בטלפון חדש', async () => {
+  test('גיט: הקבצים של הגרסה הקודמת מומרים פעם אחת, בלי כפילויות', async () => {
     const gh = fakeGitHub();
     SY.fetchImpl = gh.handler;
-    const a = newState();
-    a.tournaments = [TT.make('אצל סבתא', null)];
-    a.sync.tournamentsVersion = 1;
-    eq(SY.pending(a), 1);
-    await SY.flush(a, CFG);
-    eq(SY.pending(a), 0);
-    eq(gh.read('data/tournaments.json').tournaments[0].name, 'אצל סבתא');
-
-    const b = newState();
-    await SY.pull(b, CFG);
-    eq(b.tournaments.map((t) => t.name), ['אצל סבתא']);
-    eq(SY.pending(b), 0, 'nothing new to upload');
-    b.tournaments.push(TT.make('בבית', null));
-    await SY.pull(b, CFG);
-    eq(SY.pending(b), 1, 'a tournament that exists only here is queued');
-    await SY.flush(b, CFG);
-    eq(gh.read('data/tournaments.json').tournaments.map((t) => t.name), ['אצל סבתא', 'בבית']);
+    const oldTour = { id: 'x1', name: 'בית', createdAt: '2025-12-31T00:00:00.000Z', updatedAt: '2025-12-31T00:00:00.000Z' };
+    const g1 = R.newGame(['A', 'B'], { rounds: 1 });
+    play(g1, 0, [0, 10]); R.finishGame(g1);
+    Object.assign(g1, { finishedAt: '2026-01-01T20:00:00.000Z', tournamentId: 'x1' });
+    const g2 = R.newGame(['B', 'A'], { rounds: 1 });
+    play(g2, 0, [0, 4]); R.finishGame(g2);
+    Object.assign(g2, { finishedAt: '2026-01-02T20:00:00.000Z', tournamentId: 'x1' });
+    const put = (path, data) => { gh.files[path] = { content: SY.b64encode(JSON.stringify(data)), sha: 'old-' + path }; };
+    put('data/games/2026-01-01_' + g1.id + '.json', g1);
+    put('data/games/2026-01-02_' + g2.id + '.json', g2);
+    put('data/tournaments.json', { tournaments: [oldTour] });
+    // this phone had only the first game (the second was saved from another phone)
+    const st = newState();
+    st.sync.legacyDone = false;
+    st.tournaments = TT.fromV1({ history: [g1], current: null, tournaments: [oldTour] });
+    const res = await SY.pull(st, CFG);
+    eq(st.sync.legacyDone, true);
+    eq(st.tournaments.length, 1);
+    eq(st.tournaments[0].players.map((p) => p.name), ['A', 'B']);
+    eq(R.finishedGames(st.tournaments[0]).length, 2);
+    eq(res.updated, 1);
+    eq(SY.pending(st), 1, 'the converted tournament is queued for its new file');
+    await SY.flush(st, CFG);
+    ok(gh.files['data/tournaments/x1.json'], 'the new file is written');
+    ok(gh.files['data/tournaments.json'] && gh.files['data/games/2026-01-01_' + g1.id + '.json'], 'the old files are left as they are');
+    const again = await SY.pull(st, CFG);
+    eq([again.added, again.updated], [0, 0]);
   });
 
   // ---------------- run ----------------

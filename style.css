@@ -12,6 +12,7 @@
   --gluck-soft: #fdeee6;
   --current: #fff8e1;
   --danger: #b42318;
+  --good: #2f7d4f;
   --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 4px 14px rgba(0, 0, 0, .05);
   --radius: 14px;
   color-scheme: light;
@@ -31,6 +32,7 @@
     --gluck-soft: #3a2218;
     --current: #2c2a1c;
     --danger: #ff6b5b;
+    --good: #6fcf8f;
     --shadow: none;
     color-scheme: dark;
   }
@@ -49,6 +51,7 @@
   --gluck-soft: #3a2218;
   --current: #2c2a1c;
   --danger: #ff6b5b;
+  --good: #6fcf8f;
   --shadow: none;
   color-scheme: dark;
 }
@@ -292,3 +295,46 @@ details li { margin: 4px 0; }
 .h2h { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: end; }
 .h2h-score { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; text-align: center; margin: 14px 0 6px; }
 .h2h-score .big { font-size: 2.4rem; font-weight: 800; line-height: 1; }
+
+/* ---------- tournament table: one row per participant ---------- */
+h2.sec { margin-top: 18px; }
+.tour-head { font-size: 1.3rem; font-weight: 800; margin: 2px 0; }
+.standings { margin: 12px 0 6px; }
+.srow {
+  display: grid; grid-template-columns: 2em minmax(0, 1fr) 4.2em 4.6em; align-items: center; gap: 6px;
+  width: 100%; margin: 0 0 6px; padding: 10px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);
+  font: inherit; color: inherit; text-align: right;
+}
+button.srow { cursor: pointer; }
+.srow.lead { border-inline-start: 4px solid var(--accent); }
+.srow.head { background: transparent; border: 0; box-shadow: none; padding: 0 10px 2px; margin: 0; font-size: .74rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
+.card .srow { box-shadow: none; background: var(--surface-2); }
+.card .srow.head { background: transparent; }
+.s-place { font-weight: 800; text-align: center; }
+.s-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.s-name b { font-size: 1.05rem; }
+.s-wins { font-size: .8rem; color: var(--muted); }
+.s-move { font-size: .75rem; font-weight: 700; margin-inline-start: 6px; }
+.s-move.up { color: var(--good); }
+.s-move.down { color: var(--danger); }
+.s-game, .s-total { text-align: center; }
+.srow:not(.head) .s-game { color: var(--muted); font-weight: 600; }
+.srow:not(.head) .s-total { font-weight: 800; font-size: 1.15rem; }
+.s-note { font-size: .82rem; }
+.fold {
+  display: block; width: 100%; margin: 8px 0 0; padding: 10px 4px;
+  border: 0; border-top: 1px dashed var(--line); background: transparent;
+  color: var(--accent); font-weight: 600; text-align: right; cursor: pointer;
+}
+.pname-static { flex: 1; font-weight: 600; font-size: 1.05rem; }
+
+/* a participant's points, round by round */
+.plist li { border-bottom: 1px solid var(--line); }
+.prow {
+  display: grid; grid-template-columns: 4.5em minmax(0, 1fr) auto; align-items: center; gap: 8px;
+  width: 100%; min-height: 44px; padding: 6px 2px; border: 0; background: transparent;
+  font: inherit; color: inherit; text-align: right; cursor: pointer;
+}
+.prow .muted { font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ptotal { margin: 8px 0 0; text-align: left; }

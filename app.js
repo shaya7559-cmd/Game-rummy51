@@ -1,4 +1,5 @@
-/* Rummy 51 — the UI. Every screen is rendered from state; clicks are routed by data-act. */
+/* Rummy 51 — the UI. Every screen is rendered from state; clicks are routed by data-act.
+   state = { tournaments: [Tournament], activeId, backupCount, sync } (see logic.js for Tournament and Game). */
 (function () {
   'use strict';
 
@@ -7,7 +8,8 @@
   const T = window.RummyTournaments;
   const SY = window.RummySync;
 
-  const KEY = 'rummy51.v1';
+  const KEY = 'rummy51.v2';
+  const OLD_KEY = 'rummy51.v1';
   const GH_KEY = 'rummy51.github';
   const MIN_PLAYERS = 2;
   const MAX_PLAYERS = 8;
@@ -15,14 +17,16 @@
   const UNDO_LIMIT = 30;
   const BACKUP_NAG = 10;
 
+  let converted = 0;
   let state = loadState();
   let gh = loadGh();
-  let undoStack = [];
+  let undoStack = []; // snapshots of the open game: { tid, gid, json }
   let view = { name: 'home' };
   let stack = [];
   let overlays = [];
   let sheet = null;
   let sheetLayer = null;
+  let psheet = null;
 
   const $view = document.getElementById('view');
   const $overlay = document.getElementById('overlay-root');
@@ -33,9 +37,7 @@
   const pct = (x) => Math.round(x * 100) + '%';
   const round1 = (x) => String(Math.round(x * 10) / 10);
   const clone = (o) => JSON.parse(JSON.stringify(o));
-  const names = (g) => g.players.map((p) => p.name);
-  const findGame = (id) => state.history.find((g) => g.id === id);
-  const tourName = (g) => T.nameOf(state.tournaments, g);
+  const names = (x) => x.players.map((p) => p.name);
   const winsText = (n) => (n === 1 ? 'ניצחון 1' : n + ' ניצחונות');
   const gamesText = (n) => (n === 1 ? 'משחק 1' : n + ' משחקים');
   const roundsText = (n) => (n === 1 ? 'תור 1' : n + ' תורים');
@@ -60,36 +62,51 @@
     toastTimer = setTimeout(() => t.classList.remove('show'), 2800);
   }
 
+  // ---------- state ----------
+  function tourById(id) {
+    const t = id ? T.find(state.tournaments, id) : null;
+    return t && !t.deleted ? t : null;
+  }
+
+  // The tournament shown on the home screen: the one opened last, unless it went to the archive.
+  function activeTour() {
+    const t = tourById(state.activeId);
+    return t && !t.archived ? t : null;
+  }
+
+  const findGame = (id) => T.findGame(state.tournaments, id);
+  const allGames = () => T.allGames(state.tournaments);
+  const tourName = (g) => { const t = tourById(g.tournamentId); return t ? t.name : 'ללא טורניר'; };
+  const gameNumber = (t, g) => R.finishedGames(t).findIndex((x) => x.id === g.id) + 1;
+
+  // The tournament screen's tournament and its open game.
+  function curTG() {
+    const t = view.name === 'tournament' ? tourById(view.id) : null;
+    return { t, g: t ? R.openGame(t) : null };
+  }
+
   // ---------- storage ----------
   function loadState() {
     let s = null;
     try { s = JSON.parse(localStorage.getItem(KEY)); } catch (e) { /* empty or blocked storage */ }
-    if (!s || !Array.isArray(s.history)) s = { current: null, history: [], lastPlayers: [], backupCount: 0 };
-    if (!Array.isArray(s.tournaments)) s.tournaments = [];
+    if (!s || !Array.isArray(s.tournaments)) s = fromOldVersion() || { tournaments: [], activeId: null, backupCount: 0 };
     s.sync = Object.assign(SY.emptySync(), s.sync || {});
+    s.tournaments.forEach((t) => { if (!t.deleted) R.normalize(t); });
     return s;
   }
 
-  function toursChanged() {
-    state.sync.tournamentsVersion++;
-  }
-
-  // Gives every game a tournament (games from before tournaments, pulled from git or imported)
-  // and queues whatever changed for git. Returns true when something changed.
-  function fixTournaments() {
-    const res = T.ensure(state.tournaments, state.history.concat(state.current ? [state.current] : []));
-    res.games.forEach((id) => {
-      if (state.current && state.current.id === id) state.sync.currentVersion++;
-      else if (!state.sync.unsyncedGames.includes(id)) state.sync.unsyncedGames.push(id);
-    });
-    if (res.tournaments) toursChanged();
-    return res.games.length > 0 || res.tournaments;
-  }
-
-  // The tournament of the open game, or of the last game that was started.
-  function homeTournament() {
-    const t = T.find(state.tournaments, state.current ? state.current.tournamentId : state.lastTournamentId);
-    return t && !t.deleted ? t : null;
+  // The previous version kept a list of games. They move into their tournaments once; the old copy stays as it is.
+  function fromOldVersion() {
+    let old = null;
+    try { old = JSON.parse(localStorage.getItem(OLD_KEY)); } catch (e) { return null; }
+    if (!old || !Array.isArray(old.history)) return null;
+    const list = T.fromV1(old);
+    const s = { tournaments: list, activeId: null, backupCount: old.backupCount || 0, sync: SY.emptySync() };
+    list.forEach((t) => SY.markDirty(s, t.id));
+    const want = old.current ? old.current.tournamentId : old.lastTournamentId;
+    s.activeId = list.some((t) => t.id === want) ? want : (list[list.length - 1] || {}).id || null;
+    converted = list.length;
+    return s;
   }
 
   function persist() {
@@ -113,27 +130,43 @@
     } catch (e) { /* storage blocked */ }
   }
 
-  // ---------- current game changes (undoable) ----------
-  function changeCurrent(fn) {
-    undoStack.push(JSON.stringify(state.current));
-    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
-    const out = fn(state.current);
-    currentSaved();
-    return out;
-  }
-
-  function currentSaved() {
-    state.sync.currentVersion++;
+  // ---------- changes ----------
+  // Saves a changed tournament here and queues it for git.
+  function saveTour(t) {
+    SY.markDirty(state, t.id);
     persist();
     scheduleSync();
+  }
+
+  function tourSaved(t) {
+    saveTour(t);
     render();
   }
 
+  // A change to a game. Changes to the open game can be undone.
+  function changeGame(t, g, fn) {
+    if (!g.finishedAt) {
+      undoStack.push({ tid: t.id, gid: g.id, json: JSON.stringify(g) });
+      if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    }
+    const out = fn(g);
+    R.touchTour(t, g);
+    tourSaved(t);
+    return out;
+  }
+
+  function canUndo(t, g) {
+    const last = undoStack[undoStack.length - 1];
+    return !!(g && last && last.tid === t.id && last.gid === g.id);
+  }
+
   function undo() {
-    if (!undoStack.length) return;
-    state.current = JSON.parse(undoStack.pop());
-    R.touch(state.current);
-    currentSaved();
+    const { t, g } = curTG();
+    if (!canUndo(t, g)) return;
+    const back = JSON.parse(undoStack.pop().json);
+    t.games[t.games.indexOf(g)] = back;
+    R.touchTour(t, back);
+    tourSaved(t);
     toast('הפעולה האחרונה בוטלה');
   }
 
@@ -161,6 +194,15 @@
   function back() {
     if (stack.length) history.back();
     else goHome();
+  }
+
+  function openTour(id) {
+    if (!tourById(id)) return;
+    if (psheet) closePlayer();
+    state.activeId = id;
+    persist();
+    if (view.name === 'tournament' && view.id === id) return;
+    go('tournament', { id });
   }
 
   // The phone's back button closes an open sheet or dialog before it leaves the screen.
@@ -263,19 +305,28 @@
     syncTimer = setTimeout(runSync, delay == null ? 1200 : delay);
   }
 
+  // Screens with typed text that a re-render would lose are left alone.
+  function renderIfIdle() {
+    if (view.name !== 'setup' && view.name !== 'settings') render();
+  }
+
   async function runSync() {
     if (!gh) return;
     if (syncing) { syncAgain = true; return; }
     if (!SY.pending(state)) { renderSyncBadge(); return; }
     syncing = true;
     renderSyncBadge();
+    let changed = false;
     try {
+      const before = state.tournaments.map(T.sig).join();
       await SY.flush(state, gh);
+      changed = state.tournaments.map(T.sig).join() !== before; // another phone's changes were merged in
     } catch (e) {
       state.sync.lastError = e.message;
     }
     syncing = false;
     persist();
+    if (changed) renderIfIdle();
     renderSyncBadge();
     if (syncAgain) { syncAgain = false; scheduleSync(0); }
   }
@@ -284,13 +335,15 @@
     if (!gh || syncing) return;
     syncing = true;
     renderSyncBadge();
-    let remoteCurrent = null;
     try {
       const res = await SY.pull(state, gh);
-      remoteCurrent = res.remoteCurrent;
-      fixTournaments();
+      if (!activeTour()) {
+        const recent = T.overview(state.tournaments).find((r) => !r.tournament.archived);
+        if (recent) state.activeId = recent.tournament.id;
+      }
       persist();
-      if (res.added) toast('נטענו מגיט ' + res.added + ' משחקים');
+      if (res.added) toast('נטענו מגיט ' + res.added + ' טורנירים');
+      else if (res.updated) toast('עודכן מגיט: ' + (res.updated === 1 ? 'טורניר 1' : res.updated + ' טורנירים'));
       else if (!quiet) toast('הסנכרון הסתיים');
     } catch (e) {
       state.sync.lastError = e.message;
@@ -298,51 +351,16 @@
       if (!quiet) toast(e.message);
     }
     syncing = false;
-    await offerRemoteCurrent(remoteCurrent);
-    render();
+    renderIfIdle();
     scheduleSync(0);
-  }
-
-  // A game in progress saved from another phone can be continued here.
-  async function offerRemoteCurrent(remote) {
-    if (!remote || remote.finishedAt || !Array.isArray(remote.rounds)) return;
-    if (findGame(remote.id)) return;
-    const local = state.current;
-    if (local && local.id === remote.id) {
-      if ((remote.updatedAt || '') > (local.updatedAt || '')) {
-        state.current = remote;
-        undoStack = [];
-        state.sync.syncedVersion = state.sync.currentVersion;
-        fixTournaments();
-        persist();
-        toast('המשחק הפתוח עודכן מגיט');
-      }
-      return;
-    }
-    if (local && (local.updatedAt || '') >= (remote.updatedAt || '')) return;
-    const take = await ask({
-      title: 'נמצא בגיט משחק פתוח',
-      body: `${esc(names(remote).join(', '))} · שוחקו ${R.playedCount(remote)} תורים.<br>להמשיך אותו בטלפון הזה?${local ? ' המשחק הפתוח כאן יוחלף.' : ''}`,
-      buttons: [{ label: 'המשך אותו כאן', value: true, kind: 'primary' }, { label: 'לא', value: false }]
-    });
-    if (!take) return;
-    state.current = remote;
-    undoStack = [];
-    state.sync.syncedVersion = state.sync.currentVersion;
-    fixTournaments();
-    if (remote.tournamentId) state.lastTournamentId = remote.tournamentId;
-    persist();
-    if (!stack.length) history.pushState({ rummy: 1 }, '');
-    stack = [{ name: 'home' }];
-    view = { name: 'game' };
   }
 
   function syncStatusText() {
     const s = state.sync;
     const n = SY.pending(state);
     if (syncing) return 'שומר בגיט…';
-    if (s.lastError && n) return `לא נשמר: ${s.lastError}. ממתינים לשמירה: ${n}`;
-    if (n) return 'ממתינים לשמירה: ' + n;
+    if (s.lastError && n) return `לא נשמר: ${s.lastError}. טורנירים שממתינים לשמירה: ${n}`;
+    if (n) return 'טורנירים שממתינים לשמירה: ' + n;
     return s.lastSyncAt ? 'הכול שמור בגיט · סנכרון אחרון ' + fmtTime(s.lastSyncAt) : 'הכול שמור בגיט';
   }
 
@@ -385,20 +403,38 @@
       </button>`;
   }
 
-  // The top three of a tournament; opens its reports.
-  function tournamentCard(id) {
-    const row = T.overview(state.tournaments, state.history).find((o) => o.tournament.id === id);
-    if (!row || !row.games) return '';
-    return `
-      <button class="card" data-act="tour-reports" data-id="${id}">
-        <div class="label">המובילים בטורניר ${esc(row.tournament.name)} · ${gamesText(row.games)}</div>
-        <ol class="mini-rank stack">${row.top.map((s, i) => `<li>${i + 1}. ${esc(s.name)} <b>${winsText(s.wins)}</b></li>`).join('')}</ol>
-        <div class="muted tour-line">לדוחות של הטורניר ←</div>
-      </button>`;
+  // The tournament table: one row per participant with place, name, points in the game and the total.
+  // The game column is the open game, or the last game when none is open.
+  // opts.rows = clickable rows (open the participant's points), opts.moves = arrows for places gained or lost.
+  function standingsHtml(t, opts) {
+    opts = opts || {};
+    const rows = R.standings(t);
+    const done = R.finishedGames(t);
+    const open = R.openGame(t);
+    const ref = open || done[done.length - 1];
+    const gt = ref ? R.totals(ref) : null;
+    const moves = opts.moves ? R.placeMoves(t) : {};
+    const tag = opts.rows ? 'button' : 'div';
+    let h = `<div class="standings">
+      <div class="srow head"><span class="s-place">#</span><span>משתתף</span><span class="s-game">${open ? 'במשחק' : ref ? 'משחק אחרון' : ''}</span><span class="s-total">כללי</span></div>`;
+    rows.forEach((r) => {
+      const lead = done.length && r.place === 1;
+      const mv = moves[r.player.id];
+      const move = mv ? `<span class="s-move ${mv > 0 ? 'up' : 'down'}" title="${mv > 0 ? 'עלה' : 'ירד'} ${Math.abs(mv)}">${mv > 0 ? '▲' : '▼'}${Math.abs(mv)}</span>` : '';
+      const g = gt && r.player.id in gt ? gt[r.player.id] : null;
+      h += `
+        <${tag} class="srow${lead ? ' lead' : ''}"${opts.rows ? ` data-act="player" data-tid="${t.id}" data-pid="${r.player.id}"` : ''}>
+          <span class="s-place">${done.length ? r.place : ''}</span>
+          <span class="s-name"><b>${esc(r.player.name)}</b>${r.wins ? ` <span class="s-wins">🏆 ${r.wins}</span>` : ''}${move}</span>
+          <span class="s-game num">${g == null ? '' : g}</span>
+          <span class="s-total num">${r.total}</span>
+        </${tag}>`;
+    });
+    return h + '</div>';
   }
 
   function backupNag() {
-    const unsaved = state.history.length - (state.backupCount || 0);
+    const unsaved = allGames().length - (state.backupCount || 0);
     if (gh || unsaved < BACKUP_NAG) return '';
     return `
       <button class="card warn" data-act="go" data-to="settings">
@@ -407,29 +443,49 @@
       </button>`;
   }
 
+  function openGameText(g) {
+    const i = R.currentIndex(g);
+    return i >= 0 ? `תור ${i + 1} מתוך ${g.rounds.length}` : 'כל התורים שוחקו';
+  }
+
   VIEWS.home = () => {
-    const g = state.current;
+    const t = activeTour();
+    const others = T.overview(state.tournaments).filter((r) => !r.tournament.archived && (!t || r.tournament.id !== t.id));
     let h = '';
-    if (g) {
-      const i = R.currentIndex(g);
+    if (t) {
+      const open = R.openGame(t);
+      const done = R.finishedGames(t);
+      const last = done[done.length - 1];
       h += `
-        <button class="card" data-act="go" data-to="game">
-          <div class="label">משחק פתוח</div>
-          <div class="winner-name" style="font-size:1.25rem">${i >= 0 ? `תור ${i + 1} מתוך ${g.rounds.length}` : 'כל התורים שוחקו'}</div>
-          <div class="muted">${esc(names(g).join(' · '))}</div>
-          <div class="muted tour-line">טורניר: ${esc(tourName(g))}</div>
+        <button class="card" data-act="open-tour" data-id="${t.id}">
+          <div class="label">הטורניר הפעיל · ${done.length ? gamesText(done.length) : 'עוד אין משחקים שהסתיימו'}</div>
+          <div class="tour-head">${esc(t.name)}</div>
+          ${last ? `<div class="muted">במשחק האחרון ניצח ${esc(R.playerById(last, last.winnerId).name)} · ${fmtDate(last.finishedAt)}</div>` : ''}
+          ${standingsHtml(t)}
         </button>
-        <button class="btn primary big" data-act="go" data-to="game">המשך משחק</button>
-        <div class="row"><button class="btn" data-act="new-game">משחק חדש</button></div>`;
+        ${open
+          ? `<button class="btn primary big" data-act="open-tour" data-id="${t.id}">המשך משחק · ${openGameText(open)}</button>`
+          : `<button class="btn primary big" data-act="next-game" data-id="${t.id}">משחק חדש בטורניר</button>`}
+        <div class="row"><button class="btn" data-act="new-tour">+ טורניר חדש</button></div>`;
     } else {
-      h += '<button class="btn primary big" data-act="new-game">משחק חדש</button>';
+      if (!others.length) {
+        h += `<section class="card"><h2>איך זה עובד</h2>
+          <p class="muted">פותחים טורניר עם המשתתפים, ומשחקים בו כמה משחקים שרוצים. כולם משחקים בכל משחק.
+          הטבלה מסודרת לפי הניקוד הכללי: הכי מעט נקודות במקום הראשון.</p></section>`;
+      }
+      h += '<button class="btn primary big" data-act="new-tour">טורניר חדש</button>';
     }
-    // Last winner and leaders of the current tournament; any last game when it has none yet.
-    const done = ST.finished(state.history);
-    const ht = homeTournament();
-    const inTour = ht ? T.gamesOf(done, ht.id) : [];
-    const last = inTour.length ? inTour[inTour.length - 1] : ST.lastGame(done);
-    if (last) h += '<div style="height:12px"></div>' + lastWinnerCard(last) + tournamentCard(last.tournamentId);
+    if (others.length) {
+      h += `<h2 class="sec">${t ? 'עוד טורנירים פעילים' : 'טורנירים פעילים'}</h2><ul class="list">` + others.map((r) => {
+        const x = r.tournament;
+        return `
+          <li><button class="card" data-act="open-tour" data-id="${x.id}">
+            <div class="hist-top"><b class="tour-title">${esc(x.name)}</b><span>${r.games ? gamesText(r.games) : 'עוד אין משחקים'}</span></div>
+            ${r.open ? `<div class="muted">משחק פתוח · ${openGameText(r.open)}</div>` : ''}
+            ${r.leaders.length ? `<div class="muted">מוביל: ${esc(r.leaders.map((l) => l.player.name).join(', '))} (${r.leaders[0].total})</div>` : ''}
+          </button></li>`;
+      }).join('') + '</ul>';
+    }
     h += backupNag();
     h += `
       <div class="tiles">
@@ -441,78 +497,87 @@
     return h;
   };
 
-  // ---------- setup ----------
-  VIEWS.setup = () => {
-    const known = ST.playerNames(state.history);
-    const rows = view.names.map((n, i) => `
+  // ---------- new tournament ----------
+  function knownNames() {
+    const count = {};
+    T.live(state.tournaments).forEach((t) => {
+      const n = R.finishedGames(t).length + 1;
+      t.players.forEach((p) => { count[p.name] = (count[p.name] || 0) + n; });
+    });
+    return Object.keys(count).sort((a, b) => count[b] - count[a] || a.localeCompare(b, 'he'));
+  }
+
+  function dealerRows(list, editable) {
+    return list.map((n, i) => `
       <li>
         <button class="deal-chip${view.firstDealer === i ? ' on' : ''}" data-act="pick-dealer" data-i="${i}" aria-pressed="${view.firstDealer === i}">מחלק</button>
-        <input class="pname" data-i="${i}" value="${esc(n)}" placeholder="שחקן ${i + 1}" list="known-names" maxlength="20" autocomplete="off" enterkeyhint="next">
-        <button class="btn icon" data-act="move" data-i="${i}" data-d="-1" aria-label="הזז למעלה"${i === 0 ? ' disabled' : ''}>↑</button>
-        <button class="btn icon" data-act="move" data-i="${i}" data-d="1" aria-label="הזז למטה"${i === view.names.length - 1 ? ' disabled' : ''}>↓</button>
-        <button class="btn icon danger" data-act="remove-player" data-i="${i}" aria-label="הסר"${view.names.length <= MIN_PLAYERS ? ' disabled' : ''}>✕</button>
+        ${editable
+          ? `<input class="pname" data-i="${i}" value="${esc(n)}" placeholder="משתתף ${i + 1}" list="known-names" maxlength="20" autocomplete="off" enterkeyhint="next">
+             <button class="btn icon" data-act="move" data-i="${i}" data-d="-1" aria-label="הזז למעלה"${i === 0 ? ' disabled' : ''}>↑</button>
+             <button class="btn icon" data-act="move" data-i="${i}" data-d="1" aria-label="הזז למטה"${i === list.length - 1 ? ' disabled' : ''}>↓</button>
+             <button class="btn icon danger" data-act="remove-player" data-i="${i}" aria-label="הסר"${list.length <= MIN_PLAYERS ? ' disabled' : ''}>✕</button>`
+          : `<span class="pname-static">${esc(n)}</span>`}
       </li>`).join('');
+  }
+
+  function roundsStepper() {
     return `
-      <section class="card form" id="tour-pick">${tourPickHtml()}</section>
-      <h2>שחקנים</h2>
-      <p class="muted">לפי סדר הישיבה, כי החלוקה עוברת לפי הסדר. לחץ "מחלק" ליד מי שמחלק ראשון.</p>
-      <ul class="player-list">${rows}</ul>
-      <datalist id="known-names">${known.map((n) => `<option value="${esc(n)}">`).join('')}</datalist>
-      ${view.names.length < MAX_PLAYERS ? '<button class="btn block" data-act="add-player">+ הוסף שחקן</button>' : ''}
       <div class="field-row">
-        <b>מספר תורים</b>
+        <b>מספר תורים במשחק</b>
         <div class="stepper">
           <button class="btn" data-act="rounds" data-d="-1" aria-label="פחות">−</button>
           <span class="val num">${view.rounds}</span>
           <button class="btn" data-act="rounds" data-d="1" aria-label="יותר">+</button>
         </div>
       </div>
-      <p class="muted">גלוק אוטומטי בכל תור רביעי (4, 8, 12…). אפשר להוסיף תורים או לסיים מוקדם תוך כדי משחק.</p>
-      <button class="btn primary big" data-act="start-game">התחל משחק</button>
+      <p class="muted">גלוק אוטומטי בכל תור רביעי (4, 8, 12…). אפשר להוסיף תורים או לסיים מוקדם תוך כדי משחק.</p>`;
+  }
+
+  VIEWS.setup = () => {
+    const known = knownNames();
+    return `
+      <h2>טורניר חדש</h2>
+      <section class="card form">
+        <label for="tour-name">שם הטורניר</label>
+        <input type="text" id="tour-name" value="${esc(view.tourName)}" placeholder="${esc(T.defaultName(view.names) || 'למשל: אצל סבתא')}" maxlength="40" autocomplete="off" enterkeyhint="next">
+        <p class="muted tour-line">לא חובה. בלי שם, הטורניר נקרא לפי המשתתפים.</p>
+      </section>
+      <h2>משתתפים</h2>
+      <p class="muted">לפי סדר הישיבה, כי החלוקה עוברת לפי הסדר. לחץ "מחלק" ליד מי שמחלק ראשון. כולם משחקים בכל משחק בטורניר.</p>
+      <ul class="player-list">${dealerRows(view.names, true)}</ul>
+      <datalist id="known-names">${known.map((n) => `<option value="${esc(n)}">`).join('')}</datalist>
+      ${view.names.length < MAX_PLAYERS ? '<button class="btn block" data-act="add-player">+ הוסף משתתף</button>' : ''}
+      <div id="same-lineup">${sameLineupHtml()}</div>
+      ${roundsStepper()}
+      <button class="btn primary big" data-act="start-tour">פתח טורניר והתחל משחק</button>
       <p class="error" id="setup-error"></p>`;
   };
 
-  // tourSel = a tournament id or 'new'. Until the user picks one (tourManual), it follows the
-  // lineup: the tournament these players played in last, or a new one named after them.
-  function tourPickHtml() {
-    const open = T.live(state.tournaments).filter((t) => !t.archived);
-    let h = `
-      <label for="tour-sel">טורניר</label>
-      <select id="tour-sel" data-field="tourSel">
-        ${open.map((t) => `<option value="${t.id}"${view.tourSel === t.id ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}
-        <option value="new"${view.tourSel === 'new' ? ' selected' : ''}>+ טורניר חדש…</option>
-      </select>`;
-    if (view.tourSel === 'new') {
-      h += `
-        <input type="text" id="tour-name" class="tour-name" value="${esc(view.tourName)}" placeholder="שם הטורניר, למשל: אצל סבתא" maxlength="40" autocomplete="off" enterkeyhint="done">
-        <p class="muted tour-line">${view.tourManual ? 'ייפתח טורניר חדש בשם הזה.' : 'הרכב חדש, ולכן ייפתח לו טורניר חדש. אפשר לשנות את השם או לבחור טורניר קיים.'}</p>`;
-    } else if (!view.tourManual) {
-      h += '<p class="muted tour-line">נבחר לבד לפי ההרכב. אפשר לבחור טורניר אחר.</p>';
-    }
-    return h;
+  // A tournament with exactly these participants is already open: offer it.
+  function sameLineupHtml() {
+    const ns = view.names.map(R.cleanName);
+    if (ns.length < MIN_PLAYERS || ns.some((n) => !n)) return '';
+    const t = T.findByLineup(state.tournaments, ns);
+    if (!t) return '';
+    return `
+      <div class="card warn">
+        <b>כבר יש טורניר פעיל עם המשתתפים האלה: ${esc(t.name)}</b>
+        <div class="muted">אפשר להמשיך אותו, או לפתוח טורניר חדש.</div>
+        <div class="tour-actions"><button class="btn sm" data-act="open-tour" data-id="${t.id}">להמשיך את ${esc(t.name)}</button></div>
+      </div>`;
   }
 
-  function refreshTourPick() {
-    const el = document.getElementById('tour-pick');
-    if (el) el.innerHTML = tourPickHtml();
+  function refreshSetup() {
+    const el = document.getElementById('same-lineup');
+    if (el) el.innerHTML = sameLineupHtml();
+    const input = document.getElementById('tour-name');
+    if (input) input.placeholder = T.defaultName(view.names) || 'למשל: אצל סבתא';
   }
 
-  function autoTournament(v) {
-    const ns = v.names.map(R.cleanName);
-    if (!v.tourNameEdited) v.tourName = T.defaultName(ns);
-    if (v.tourManual) return;
-    const t = T.suggest(state.tournaments, state.history, ns);
-    v.tourSel = t ? t.id : 'new';
-  }
-
-  function startSetup(list, tourId) {
-    const ns = (list || []).slice(0, MAX_PLAYERS);
-    while (ns.length < MIN_PLAYERS) ns.push('');
-    const t = T.find(state.tournaments, tourId);
-    const keep = t && !t.deleted && !t.archived;
-    const params = { names: ns, firstDealer: 0, rounds: R.DEFAULT_ROUNDS, tourSel: keep ? t.id : 'new', tourManual: keep, tourName: '', tourNameEdited: false };
-    autoTournament(params);
-    go('setup', params);
+  function startSetup() {
+    go('setup', { names: ['', ''], firstDealer: 0, rounds: R.DEFAULT_ROUNDS, tourName: '' });
+    const first = document.querySelector('.pname');
+    if (first) first.focus();
   }
 
   function movePlayer(i, d) {
@@ -522,7 +587,6 @@
     [n[i], n[j]] = [n[j], n[i]];
     if (view.firstDealer === i) view.firstDealer = j;
     else if (view.firstDealer === j) view.firstDealer = i;
-    autoTournament(view);
     render();
   }
 
@@ -531,90 +595,79 @@
     view.names.splice(i, 1);
     if (view.firstDealer === i) view.firstDealer = 0;
     else if (view.firstDealer > i) view.firstDealer--;
-    autoTournament(view);
     render();
   }
 
-  // The tournament chosen on the setup screen; a new one is created here.
-  function setupTournament(ns) {
-    let t = view.tourSel !== 'new' ? T.find(state.tournaments, view.tourSel) : null;
-    if (!t || t.deleted) {
-      const name = R.cleanName(view.tourName) || T.defaultName(ns);
-      t = T.findByName(state.tournaments, name);
-      if (!t) {
-        t = T.make(name, view.tourNameEdited ? null : T.lineupKey(ns));
-        state.tournaments.push(t);
-        toursChanged();
-      }
-    }
-    if (t.archived) {
-      t.archived = false;
-      T.touch(t);
-      toursChanged();
-    }
-    return t;
+  // A name that is not taken: the participants' names, and the date when they already have a tournament.
+  function freeName(base) {
+    if (!T.findByName(state.tournaments, base)) return base;
+    const dated = base + ' · ' + fmtDate(new Date().toISOString());
+    let name = dated;
+    for (let k = 2; T.findByName(state.tournaments, name); k++) name = dated + ' (' + k + ')';
+    return name;
   }
 
-  function startGame() {
+  function startTour() {
     const ns = view.names.map(R.cleanName);
+    const typed = R.cleanName(view.tourName);
     let err = '';
     if (ns.some((n) => !n)) err = 'יש שורה בלי שם. מלא אותה או הסר אותה.';
     else {
       const dup = ns.find((n, i) => ns.indexOf(n) !== i);
       if (dup) err = `השם "${dup}" מופיע פעמיים`;
+      else if (typed && T.findByName(state.tournaments, typed)) err = 'כבר יש טורניר בשם הזה. כתוב שם אחר.';
     }
     if (err) { document.getElementById('setup-error').textContent = err; return; }
-    const first = ns[view.firstDealer];
-    const t = setupTournament(ns);
-    state.current = R.newGame(ns, { firstDealer: view.firstDealer, rounds: view.rounds });
-    state.current.tournamentId = t.id;
-    state.current.tournamentName = t.name;
-    state.lastTournamentId = t.id;
-    state.lastPlayers = ns;
+    const t = R.newTournament(typed || freeName(T.defaultName(ns)), ns);
+    state.tournaments.push(t);
+    const g = R.startGame(t, { firstDealer: view.firstDealer, rounds: view.rounds });
+    state.activeId = t.id;
     undoStack = [];
-    state.sync.currentVersion++;
-    persist();
-    scheduleSync();
+    saveTour(t);
     stack = [{ name: 'home' }];
-    replace('game');
-    toast('בהצלחה! ' + first + ' מחלק ראשון · ' + t.name);
+    replace('tournament', { id: t.id });
+    toast('בהצלחה! ' + R.dealer(g, 0).name + ' מחלק ראשון');
   }
 
-  async function newGame() {
-    if (state.current) {
-      const played = R.playedCount(state.current);
-      const buttons = [];
-      if (played) buttons.push({ label: 'לסיים ולשמור אותו', value: 'finish', kind: 'primary' });
-      buttons.push({ label: 'למחוק אותו', value: 'discard', kind: 'danger' }, { label: 'ביטול', value: null });
-      const choice = await ask({ title: 'יש משחק פתוח', body: 'מה לעשות עם המשחק הפתוח לפני שמתחילים חדש?', buttons, cancel: null });
-      if (!choice) return;
-      if (choice === 'finish') {
-        const g = await finishGame({ show: false });
-        if (!g) return;
-        toast('המשחק נשמר · ניצח ' + R.playerById(g, g.winnerId).name);
-      } else if (!(await confirmDiscard())) {
-        return;
-      }
-    }
-    startSetup(state.lastPlayers);
-  }
+  // ---------- next game in a tournament ----------
+  VIEWS.next = () => {
+    const t = tourById(view.id);
+    if (!t) { view = { name: 'home' }; return VIEWS.home(); }
+    if (R.openGame(t)) { view = { name: 'tournament', id: t.id }; return VIEWS.tournament(); }
+    const n = R.finishedGames(t).length + 1;
+    return `
+      <h2>משחק ${n} · ${esc(t.name)}</h2>
+      <p class="muted">אותם משתתפים, לפי סדר הישיבה. לחץ "מחלק" ליד מי שמחלק ראשון.</p>
+      <ul class="player-list">${dealerRows(names(t), false)}</ul>
+      ${roundsStepper()}
+      <button class="btn primary big" data-act="start-next">התחל משחק ${n}</button>`;
+  };
 
-  async function confirmDiscard() {
-    const ok = await ask({
-      title: 'למחוק את המשחק הפתוח?',
-      body: 'הניקוד של המשחק הזה יימחק ולא יישמר בהיסטוריה.',
-      buttons: [{ label: 'מחק', value: true, kind: 'danger' }, { label: 'ביטול', value: false }]
-    });
-    if (!ok) return false;
-    state.current = null;
-    undoStack = [];
-    state.sync.currentVersion++;
+  function nextGame(id) {
+    const t = tourById(id);
+    if (!t) return;
+    if (R.openGame(t)) { openTour(id); return; }
+    state.activeId = id;
     persist();
-    scheduleSync();
-    return true;
+    go('next', { id, firstDealer: R.nextFirstDealer(t), rounds: R.DEFAULT_ROUNDS });
   }
 
-  // ---------- game screen ----------
+  function startNext() {
+    const t = tourById(view.id);
+    if (!t) return;
+    if (t.archived) {
+      t.archived = false;
+      R.touchMeta(t);
+    }
+    const g = R.startGame(t, { firstDealer: view.firstDealer, rounds: view.rounds });
+    undoStack = [];
+    saveTour(t);
+    stack = [{ name: 'home' }];
+    replace('tournament', { id: t.id });
+    toast('בהצלחה! ' + R.dealer(g, 0).name + ' מחלק ראשון');
+  }
+
+  // ---------- tournament screen ----------
   const GLUCK_REASON = { auto: 'גלוק קבוע (כל תור רביעי)', fresh: 'גלוק בגלל פריש', manual: 'גלוק שנקבע ידנית' };
 
   function statusNotes(r) {
@@ -625,15 +678,12 @@
     return parts.map(esc).join(' · ');
   }
 
-  VIEWS.game = () => {
-    const g = state.current;
-    if (!g) { view = { name: 'home' }; return VIEWS.home(); }
+  function gameControls(t, g) {
+    const number = R.finishedGames(t).length + 1;
     const i = R.currentIndex(g);
-    const played = R.playedCount(g);
-    let h = '';
     if (i >= 0) {
       const r = g.rounds[i];
-      h += `
+      return `
         <section class="status${r.gluck ? ' is-gluck' : ''}">
           <div class="status-top">
             <span class="round-no">תור ${i + 1} <span class="muted">מתוך ${g.rounds.length}</span></span>
@@ -641,40 +691,85 @@
           </div>
           <div class="dealer">מחלק: ${esc(R.dealer(g, i).name)}</div>
           <div class="notes muted">${statusNotes(r)}</div>
-          <div class="muted tour-line">טורניר: ${esc(tourName(g))}</div>
+          <div class="muted tour-line">${esc(t.name)} · משחק ${number}</div>
         </section>
-        <button class="btn primary big" data-act="open-round" data-i="${i}">סיום תור ${i + 1}</button>
+        <button class="btn primary big" data-act="open-round" data-gid="${g.id}" data-i="${i}">סיום תור ${i + 1}</button>
         <div class="row">
           <button class="btn" data-act="fresh">פריש</button>
           <button class="btn${r.gluck ? ' gluck-on' : ''}" data-act="toggle-gluck" data-i="${i}">${r.gluck ? 'בטל גלוק' : 'הפוך לגלוק'}</button>
         </div>`;
+    }
+    const lead = R.leaders(g);
+    return `
+      <section class="status">
+        <div class="round-no">כל ${g.rounds.length} התורים שוחקו</div>
+        <div class="dealer">${lead.length > 1 ? 'תיקו: ' + esc(lead.map((p) => p.name).join(' ו')) : 'ניצח במשחק: ' + esc(lead[0].name)}</div>
+        <div class="muted tour-line">${esc(t.name)} · משחק ${number}</div>
+      </section>
+      <button class="btn primary big" data-act="finish">סיים ושמור</button>`;
+  }
+
+  const LEGEND = `
+    <div class="legend">
+      <span>✕ תור גלוק (×2)</span><span>★ ניצח בהאנט (×2)</span><span>פ = היה פריש</span><span>לחיצה על שורה = תיקון</span>
+    </div>`;
+
+  // The finished games, newest first; a row opens the game.
+  function gamesListHtml(t) {
+    const done = R.finishedGames(t);
+    if (!done.length) return '';
+    return `<section class="card"><h3>משחקים בטורניר</h3><div class="table-scroll"><table class="data games">
+      <thead><tr><th>#</th><th>ניצח</th><th>תאריך</th><th>תורים</th></tr></thead><tbody>` +
+      done.map((g, k) => ({ g, k })).reverse().map(({ g, k }) => `
+        <tr data-act="view-game" data-id="${g.id}">
+          <td>${k + 1}</td><td>🏆 ${esc(R.playerById(g, g.winnerId).name)}</td><td>${fmtDate(g.finishedAt)}</td><td>${g.rounds.length}</td>
+        </tr>`).join('') +
+      '</tbody></table></div><p class="muted" style="margin:8px 0 0">לחיצה על משחק פותחת אותו, ושם אפשר לתקן כל תור.</p></section>';
+  }
+
+  VIEWS.tournament = () => {
+    const t = tourById(view.id);
+    if (!t) { view = { name: 'home' }; return VIEWS.home(); }
+    const g = R.openGame(t);
+    const done = R.finishedGames(t);
+    let h = '';
+    if (g) {
+      h += gameControls(t, g);
     } else {
-      const lead = R.leaders(g);
+      const last = done[done.length - 1];
       h += `
         <section class="status">
-          <div class="round-no">כל ${g.rounds.length} התורים שוחקו</div>
-          <div class="dealer">${lead.length > 1 ? 'תיקו: ' + esc(lead.map((p) => p.name).join(' ו')) : 'מוביל: ' + esc(lead[0].name)}</div>
-          ${rankList(g, false)}
+          <div class="round-no">${esc(t.name)}</div>
+          <div class="muted">${done.length ? gamesText(done.length) + ' · אחרון ' + fmtDate(last.finishedAt) : 'עוד אין משחקים'}${t.archived ? ' · בארכיון' : ''}</div>
         </section>
-        <button class="btn primary big" data-act="finish">סיים ושמור</button>`;
+        <button class="btn primary big" data-act="next-game" data-id="${t.id}">משחק חדש בטורניר</button>`;
     }
-    h += scoreTableHtml(g, true);
+    h += standingsHtml(t, { rows: true, moves: true });
+    h += `<p class="muted s-note">${done.length ? 'הכי מעט נקודות במקום הראשון. המקומות מתעדכנים בסוף כל משחק. ' : ''}לחיצה על משתתף מציגה את הנקודות שלו בכל תור, ומשם אפשר לתקן.</p>`;
+    if (g) {
+      const played = R.playedCount(g);
+      h += `<button class="fold" data-act="toggle-rounds" aria-expanded="${!!view.roundsOpen}">${view.roundsOpen ? '▾' : '▸'} פירוט התורים במשחק</button>`;
+      if (view.roundsOpen) h += scoreTableHtml(g, true) + LEGEND;
+      h += `
+        <div class="row">
+          <button class="btn" data-act="undo"${canUndo(t, g) ? '' : ' disabled'}>↶ בטל פעולה</button>
+          <button class="btn" data-act="add-round">+ הוסף תור</button>
+        </div>`;
+      if (R.currentIndex(g) >= 0 && played) h += '<button class="btn block" data-act="finish-early">סיים משחק עכשיו</button>';
+      if (!played) h += '<button class="btn block danger" data-act="discard">מחק את המשחק הזה</button>';
+    }
+    h += gamesListHtml(t);
     h += `
-      <div class="legend">
-        <span>✕ תור גלוק (×2)</span><span>★ ניצח בהאנט (×2)</span><span>פ = היה פריש</span><span>לחיצה על שורה = עריכה</span>
-      </div>
       <div class="row">
-        <button class="btn" data-act="undo"${undoStack.length ? '' : ' disabled'}>↶ בטל פעולה</button>
-        <button class="btn" data-act="add-round">+ הוסף תור</button>
+        ${done.length ? `<button class="btn sm" data-act="tour-reports" data-id="${t.id}">דוחות הטורניר</button>` : ''}
+        <button class="btn sm" data-act="tour-rename" data-id="${t.id}">שינוי שם הטורניר</button>
       </div>`;
-    if (i >= 0 && played) h += '<button class="btn block" data-act="finish-early">סיים משחק עכשיו</button>';
-    if (!played) h += '<button class="btn block danger" data-act="discard">מחק משחק</button>';
     return h;
   };
 
   function scoreTableHtml(g, editable) {
     const table = R.scoreTable(g);
-    const cur = editable ? R.currentIndex(g) : -1;
+    const cur = editable && !g.finishedAt ? R.currentIndex(g) : -1;
     const played = R.playedCount(g);
     let h = '<div class="table-wrap"><table class="score"><thead><tr><th class="c-no">#</th><th class="c-gl" title="גלוק">✕</th>';
     g.players.forEach((p) => { h += `<th>${esc(p.name)}</th>`; });
@@ -682,8 +777,8 @@
     g.rounds.forEach((r, i) => {
       const row = table.rows[i];
       const res = r.result;
-      const cls = [r.gluck ? 'gluck' : '', i === cur ? 'current' : '', res ? 'played' : ''].join(' ').trim();
-      h += `<tr class="${cls}"${editable && res ? ` data-act="open-round" data-i="${i}"` : ''}>`;
+      const cls = [r.gluck ? 'gluck' : '', i === cur ? 'current' : '', res && editable ? 'played' : ''].join(' ').trim();
+      h += `<tr class="${cls}"${editable && res ? ` data-act="open-round" data-gid="${g.id}" data-i="${i}"` : ''}>`;
       h += `<td class="c-no">${i + 1}${r.freshCount ? '<span class="fresh-mark">פ</span>' : ''}</td>`;
       h += editable && !res
         ? `<td class="c-gl toggle" data-act="toggle-gluck" data-i="${i}">${r.gluck ? '✕' : ''}</td>`
@@ -711,21 +806,19 @@
   }
 
   async function fresh() {
-    const g = state.current;
-    const i = R.currentIndex(g);
+    const { t, g } = curTG();
+    const i = g ? R.currentIndex(g) : -1;
     if (i < 0) return;
     const dealerName = R.dealer(g, i).name;
-    const res = changeCurrent((game) => R.declareFresh(game));
+    const res = changeGame(t, g, (game) => R.declareFresh(game));
     if (res.needsExtraRound) {
       const add = await ask({
         title: 'כל התורים שנותרו כבר גלוק',
         body: 'הפריש צריך להפוך תור לגלוק, אבל אין תור פנוי. להוסיף תור גלוק בסוף המשחק?',
         buttons: [{ label: 'הוסף תור גלוק', value: true, kind: 'primary' }, { label: 'לא להוסיף', value: false }]
       });
-      if (add) {
-        R.addRound(state.current, 'fresh');
-        currentSaved();
-      }
+      const cur = curTG();
+      if (add && cur.g) changeGame(cur.t, cur.g, (game) => R.addRound(game, 'fresh'));
       toast('פריש! ' + dealerName + ' מחלק שוב');
       return;
     }
@@ -733,20 +826,31 @@
   }
 
   function toggleGluck(i) {
-    const on = !state.current.rounds[i].gluck;
-    changeCurrent((g) => R.setGluck(g, i, on));
+    const { t, g } = curTG();
+    if (!g) return;
+    const on = !g.rounds[i].gluck;
+    changeGame(t, g, (game) => R.setGluck(game, i, on));
     toast('תור ' + (i + 1) + (on ? ' הפך לגלוק' : ' כבר לא גלוק'));
   }
 
   function addRound() {
-    const idx = changeCurrent((g) => R.addRound(g));
-    toast('נוסף תור ' + (idx + 1) + (state.current.rounds[idx].gluck ? ' (גלוק)' : ''));
+    const { t, g } = curTG();
+    if (!g) return;
+    const idx = changeGame(t, g, (game) => R.addRound(game));
+    toast('נוסף תור ' + (idx + 1) + (g.rounds[idx].gluck ? ' (גלוק)' : ''));
   }
 
-  // ---------- round entry sheet ----------
-  function openRound(i) {
-    const r = state.current.rounds[i];
-    sheet = { i, gluck: r.gluck, isEdit: !!r.result, res: r.result ? clone(r.result) : { winnerId: null, hand: false, entries: {} } };
+  // ---------- round entry sheet (open game, or a finished game being corrected) ----------
+  function sheetGame() {
+    const f = sheet && findGame(sheet.gid);
+    return f ? f.game : null;
+  }
+
+  function openRound(gid, i) {
+    const f = findGame(gid);
+    if (!f || !f.game.rounds[i]) return;
+    const r = f.game.rounds[i];
+    sheet = { gid, i, gluck: r.gluck, isEdit: !!r.result, res: r.result ? clone(r.result) : { winnerId: null, hand: false, entries: {} } };
     sheetLayer = addLayer('<div class="backdrop" data-act="close-sheet"></div><div class="sheet" role="dialog" aria-modal="true" id="sheet"></div>', () => {
       sheet = null;
       sheetLayer = null;
@@ -759,10 +863,12 @@
   }
 
   function renderSheet(focusPid) {
-    const g = state.current;
+    const g = sheetGame();
+    if (!g) { closeSheet(); return; }
     const s = sheet;
     const res = s.res;
-    let h = `<h2>${s.isEdit ? 'עריכת' : 'סיום'} תור ${s.i + 1}</h2>
+    let h = `<h2>${s.isEdit ? 'תיקון' : 'סיום'} תור ${s.i + 1}</h2>
+      ${g.finishedAt ? `<p class="muted">במשחק שהסתיים ב-${fmtDate(g.finishedAt)}. הניקוד בטורניר יתעדכן לפי התיקון.</p>` : ''}
       <div class="label-line">מי ניצח?</div>
       <div class="chips">${g.players.map((p) => `<button class="chip${res.winnerId === p.id ? ' on' : ''}" data-act="pick-winner" data-id="${p.id}">${esc(p.name)}</button>`).join('')}</div>
       <label class="toggle-line"><input type="checkbox" data-field="hand"${res.hand ? ' checked' : ''}> ניצח בהאנט (×2)</label>
@@ -790,7 +896,7 @@
         <button class="btn primary" data-act="save-round">שמור</button>
         <button class="btn" data-act="close-sheet">ביטול</button>
       </div>`;
-    if (s.isEdit && s.i === R.playedCount(g) - 1) h += '<button class="btn block danger" data-act="clear-round">מחק את תוצאת התור</button>';
+    if (s.isEdit && !g.finishedAt && s.i === R.playedCount(g) - 1) h += '<button class="btn block danger" data-act="clear-round">מחק את תוצאת התור</button>';
     document.getElementById('sheet').innerHTML = h;
     updateSheetPreview();
     if (focusPid) {
@@ -800,7 +906,8 @@
   }
 
   function updateSheetPreview() {
-    const g = state.current;
+    const g = sheetGame();
+    if (!g) return;
     const s = sheet;
     const res = s.res;
     const m = R.multiplier(s.gluck, res.hand);
@@ -819,8 +926,9 @@
   }
 
   function pickWinner(id) {
+    const g = sheetGame();
+    if (!g) return;
     sheet.res.winnerId = id;
-    const g = state.current;
     const firstEmpty = g.players.find((p) => {
       if (p.id === id) return false;
       const e = sheet.res.entries[p.id];
@@ -842,78 +950,166 @@
     updateSheetPreview();
   }
 
-  function saveRound() {
-    const g = state.current;
+  async function saveRound() {
+    const f = findGame(sheet.gid);
+    if (!f) { closeSheet(); return; }
     const { i, gluck, res, isEdit } = sheet;
-    const err = R.validateResult(g, res);
+    const err = R.validateResult(f.game, res);
     if (err) { document.getElementById('sheet-error').textContent = err; return; }
     closeSheet();
-    changeCurrent((game) => {
+    const wasFinished = !!f.game.finishedAt;
+    changeGame(f.tour, f.game, (game) => {
       if (game.rounds[i].gluck !== gluck) R.setGluck(game, i, gluck);
       R.setResult(game, i, res);
     });
-    if (isEdit) { toast('תור ' + (i + 1) + ' עודכן'); return; }
-    const next = R.currentIndex(state.current);
+    if (wasFinished) {
+      toast('תור ' + (i + 1) + ' תוקן');
+      await fixWinner(f.tour, f.game.id);
+      return;
+    }
+    if (isEdit) { toast('תור ' + (i + 1) + ' תוקן'); return; }
+    const next = R.currentIndex(f.game);
     if (next < 0) {
       toast('כל התורים שוחקו!');
     } else {
-      const nr = state.current.rounds[next];
-      toast(`תור ${next + 1}: ${R.dealer(state.current, next).name} מחלק${nr.gluck ? ' · גלוק ✕' : ''}`);
+      const nr = f.game.rounds[next];
+      toast(`תור ${next + 1}: ${R.dealer(f.game, next).name} מחלק${nr.gluck ? ' · גלוק ✕' : ''}`);
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
+  // A corrected finished game: when the winner no longer has the lowest total, the new one is set
+  // (on a tie, someone chooses).
+  async function fixWinner(t, gid) {
+    const g = R.findTourGame(t, gid);
+    if (!g) return;
+    const before = g.winnerId;
+    const tie = R.refreshWinner(g);
+    if (tie) {
+      const id = await ask({
+        title: 'תיקו בראש המשחק',
+        body: 'אחרי התיקון ' + esc(tie.map((p) => p.name).join(' ו')) + ' סיימו את המשחק עם אותו ניקוד. מי המנצח?',
+        buttons: tie.map((p) => ({ label: p.name, value: p.id, kind: 'primary' })),
+        cancel: null
+      });
+      g.winnerId = id || tie[0].id;
+    }
+    if (g.winnerId === before) return;
+    R.touchTour(t, g);
+    tourSaved(t);
+    toast('המנצח במשחק השתנה: ' + R.playerById(g, g.winnerId).name);
+  }
+
   function clearRound() {
+    const f = findGame(sheet.gid);
     const i = sheet.i;
     closeSheet();
-    changeCurrent((g) => R.clearResult(g, i));
+    if (!f) return;
+    changeGame(f.tour, f.game, (g) => R.clearResult(g, i));
     toast('תוצאת תור ' + (i + 1) + ' נמחקה');
   }
 
+  // ---------- a participant's points ----------
+  function openPlayer(tid, pid) {
+    const layer = addLayer('<div class="backdrop" data-act="close-player"></div><div class="sheet" role="dialog" aria-modal="true" id="psheet"></div>', () => { psheet = null; });
+    psheet = { layer, tid, pid };
+    renderPlayerSheet();
+  }
+
+  function closePlayer() {
+    if (psheet) removeLayer(psheet.layer);
+  }
+
+  function renderPlayerSheet() {
+    const t = tourById(psheet.tid);
+    const p = t && t.players.find((x) => x.id === psheet.pid);
+    if (!p) { closePlayer(); return; }
+    const row = R.standings(t).find((r) => r.player.id === p.id);
+    const done = R.finishedGames(t);
+    const g = R.openGame(t) || done[done.length - 1];
+    let h = `<h2>${esc(p.name)}</h2>
+      <p class="muted">${done.length ? `מקום ${row.place} · ${row.total} נקודות בטורניר · ${winsText(row.wins)}` : 'עוד אין משחקים שהסתיימו'}</p>`;
+    if (g && g.players.some((x) => x.id === p.id)) {
+      const table = R.scoreTable(g);
+      const played = g.rounds.map((r, i) => ({ r, i })).filter((x) => x.r.result);
+      h += `<div class="label-line">${g.finishedAt ? 'במשחק האחרון (' + fmtDate(g.finishedAt) + ')' : 'במשחק הנוכחי'} · לחיצה על תור = תיקון</div>`;
+      if (!played.length) {
+        h += '<p class="muted">עוד לא שוחקו תורים.</p>';
+      } else {
+        h += '<ul class="list plist">' + played.map(({ r, i }) => {
+          const e = r.result.entries[p.id];
+          const tags = [
+            r.result.winnerId === p.id ? 'ניצח' : e && e.noSet ? 'לא הוריד' : '',
+            r.gluck ? '✕ גלוק' : '',
+            r.result.hand ? '★ האנט' : ''
+          ].filter(Boolean).join(' · ');
+          return `<li><button class="prow" data-act="edit-round-of" data-gid="${g.id}" data-i="${i}">
+            <span>תור ${i + 1}</span><span class="muted">${tags}</span><b class="num">${signed(table.rows[i].scores[p.id])}</b></button></li>`;
+        }).join('') + `</ul><p class="ptotal">סה״כ במשחק: <b class="num">${table.totals[p.id]}</b></p>`;
+      }
+    }
+    if (done.length) {
+      h += '<div class="label-line">כל המשחקים בטורניר</div><ul class="list plist">' + done.map((x, k) => ({ x, k })).reverse().map(({ x, k }) => {
+        const tot = R.totals(x)[p.id];
+        return `<li><button class="prow" data-act="view-game" data-id="${x.id}">
+          <span>משחק ${k + 1}</span><span class="muted">${fmtDate(x.finishedAt)}${x.winnerId === p.id ? ' · 🏆 ניצח' : ''}</span><b class="num">${tot == null ? '—' : tot}</b></button></li>`;
+      }).join('') + '</ul>';
+    }
+    h += '<div class="row"><button class="btn" data-act="close-player">סגור</button></div>';
+    document.getElementById('psheet').innerHTML = h;
+  }
+
   // ---------- finishing ----------
-  async function finishGame(opts) {
-    opts = opts || {};
-    const g = state.current;
+  async function finishGame() {
+    const { t, g } = curTG();
+    if (!g) return;
     if (!R.playedCount(g)) {
-      if (await confirmDiscard()) goHome();
-      return null;
+      await discardGame();
+      return;
     }
     const lead = R.leaders(g);
     let winnerId = lead[0].id;
     if (lead.length > 1) {
       winnerId = await ask({
-        title: 'תיקו בראש הטבלה',
+        title: 'תיקו בראש המשחק',
         body: esc(lead.map((p) => p.name).join(' ו')) + ' סיימו עם אותו ניקוד. מי המנצח?',
         buttons: lead.map((p) => ({ label: p.name, value: p.id, kind: 'primary' })).concat([{ label: 'ביטול', value: null }]),
         cancel: null
       });
-      if (!winnerId) return null;
+      if (!winnerId) return;
     }
     R.finishGame(g, winnerId);
-    state.history.push(g);
-    state.current = null;
-    state.lastPlayers = names(g);
-    if (g.tournamentId) state.lastTournamentId = g.tournamentId;
-    state.sync.unsyncedGames.push(g.id);
-    state.sync.currentVersion++;
+    R.touchTour(t, g);
     undoStack = [];
-    persist();
+    saveTour(t);
     scheduleSync(0);
-    if (opts.show !== false) {
-      stack = [{ name: 'home' }];
-      replace('game-detail', { id: g.id, justFinished: true });
-    }
-    return g;
+    stack = [{ name: 'home' }];
+    replace('game-detail', { id: g.id, justFinished: true });
   }
 
   async function finishEarly() {
-    const g = state.current;
+    const { g } = curTG();
+    if (!g) return;
     const ok = await ask({
       title: 'לסיים את המשחק עכשיו?',
       body: `שוחקו ${R.playedCount(g)} מתוך ${g.rounds.length} תורים. התורים שלא שוחקו לא יישמרו, והמנצח ייקבע לפי הניקוד עד עכשיו.`,
       buttons: [{ label: 'סיים ושמור', value: true, kind: 'primary' }, { label: 'ביטול', value: false }]
     });
     if (ok) await finishGame();
+  }
+
+  async function discardGame() {
+    const { t, g } = curTG();
+    if (!g) return;
+    const ok = await ask({
+      title: 'למחוק את המשחק הזה?',
+      body: 'המשחק יימחק מהטורניר. אפשר להתחיל משחק חדש במקומו.',
+      buttons: [{ label: 'מחק', value: true, kind: 'danger' }, { label: 'ביטול', value: false }]
+    });
+    if (!ok) return;
+    R.removeGame(t, g.id);
+    undoStack = [];
+    tourSaved(t);
   }
 
   // ---------- history ----------
@@ -929,13 +1125,12 @@
   }
 
   function validTour(id) {
-    const t = T.find(state.tournaments, id);
-    return t && !t.deleted ? id : 'all';
+    return tourById(id) ? id : 'all';
   }
 
   VIEWS.history = () => {
-    const all = ST.finished(state.history);
-    if (!all.length) return '<p class="empty">עוד אין משחקים שמורים.<br>כל משחק שמסתיים יופיע כאן.</p>';
+    const all = allGames();
+    if (!all.length) return '<p class="empty">עוד אין משחקים שהסתיימו.<br>כל משחק שמסתיים יופיע כאן.</p>';
     view.tour = validTour(view.tour);
     const list = ST.filterByTournament(all, view.tour).reverse();
     const showTour = view.tour === 'all' && new Set(all.map((g) => g.tournamentId)).size > 1;
@@ -952,65 +1147,70 @@
   };
 
   VIEWS['game-detail'] = () => {
-    const g = findGame(view.id);
-    if (!g) return '<p class="empty">המשחק לא נמצא.</p>';
+    const f = findGame(view.id);
+    if (!f || !f.game.finishedAt) return '<p class="empty">המשחק לא נמצא.</p>';
+    const { tour: t, game: g } = f;
     const winner = R.ranking(g)[0].player.name;
     let h = `
       <section class="card">
         <div class="label">${view.justFinished ? 'המשחק הסתיים 🎉' : fmtDate(g.finishedAt, true)}</div>
         <div class="winner-name">🏆 ${esc(winner)}</div>
-        <div class="muted">${roundsText(g.rounds.length)}${g.endedEarly ? ` (הסתיים מוקדם, תוכננו ${g.plannedRounds})` : ''}</div>
-        <div class="muted tour-line">טורניר: ${esc(tourName(g))}</div>
+        <div class="muted">משחק ${gameNumber(t, g)} בטורניר ${esc(t.name)} · ${roundsText(g.rounds.length)}${g.endedEarly ? ` (הסתיים מוקדם, תוכננו ${g.plannedRounds})` : ''}</div>
         ${rankList(g, true)}
       </section>`;
-    h += scoreTableHtml(g, false);
     if (view.justFinished) {
-      h += `<button class="btn primary big" data-act="rematch" data-id="${g.id}">משחק חדש עם אותם שחקנים</button>
-        <div class="row"><button class="btn" data-act="home">למסך הראשי</button></div>`;
+      h += `<h2 class="sec">הטבלה בטורניר אחרי המשחק</h2>${standingsHtml(t, { moves: true })}
+        <button class="btn primary big" data-act="next-game" data-id="${t.id}">משחק הבא בטורניר</button>
+        <div class="row"><button class="btn" data-act="open-tour" data-id="${t.id}">למסך הטורניר</button></div>`;
     }
+    h += '<h2 class="sec">התורים</h2>' + scoreTableHtml(g, true) +
+      '<p class="muted">לחיצה על תור פותחת אותו לתיקון. הניקוד בטורניר מתעדכן לפי התיקון.</p>';
     h += `<button class="btn block" data-act="move-game" data-id="${g.id}">העבר לטורניר אחר</button>
-      <button class="btn block danger" data-act="delete-game" data-id="${g.id}">מחק את המשחק מההיסטוריה</button>`;
+      <button class="btn block danger" data-act="delete-game" data-id="${g.id}">מחק את המשחק</button>`;
     return h;
   };
 
+  // A game can move only to a tournament with the same participants.
   async function moveGame(id) {
-    const g = findGame(id);
-    if (!g) return;
-    const others = T.live(state.tournaments).filter((t) => !t.archived && t.id !== g.tournamentId);
-    if (!others.length) { toast('אין טורניר אחר. אפשר לפתוח אחד במסך "טורנירים".'); return; }
+    const f = findGame(id);
+    if (!f) return;
+    const key = T.lineupKey(names(f.game));
+    const others = T.active(state.tournaments).filter((t) => t.id !== f.tour.id && T.lineupKey(names(t)) === key);
+    if (!others.length) { toast('אין טורניר אחר עם אותם משתתפים'); return; }
     const to = await ask({
       title: 'להעביר לאיזה טורניר?',
-      body: 'המשחק עובר עם כל התוצאות, והדוחות של שני הטורנירים מתעדכנים.',
+      body: 'המשחק עובר עם כל התוצאות, והטבלה של שני הטורנירים מתעדכנת.',
       buttons: others.map((t) => ({ label: t.name, value: t.id })).concat([{ label: 'ביטול', value: null }]),
       cancel: null
     });
-    if (!to) return;
-    const t = T.find(state.tournaments, to);
-    g.tournamentId = t.id;
-    g.tournamentName = t.name;
-    R.touch(g);
-    if (!state.sync.unsyncedGames.includes(g.id)) state.sync.unsyncedGames.push(g.id);
-    persist();
-    scheduleSync(0);
+    const target = tourById(to);
+    if (!target) return;
+    const map = {};
+    f.game.players.forEach((p) => { map[p.id] = target.players.find((x) => x.name === p.name).id; });
+    const g = T.remapGame(f.game, map);
+    g.tournamentId = target.id;
+    target.removed = (target.removed || []).filter((x) => x !== g.id);
+    target.games.push(g);
+    R.touchTour(target, g);
+    R.normalize(target);
+    R.removeGame(f.tour, id);
+    saveTour(f.tour);
+    saveTour(target);
     render();
-    toast('המשחק הועבר לטורניר ' + t.name);
+    toast('המשחק הועבר לטורניר ' + target.name);
   }
 
   async function deleteGame(id) {
-    const g = findGame(id);
-    if (!g) return;
+    const f = findGame(id);
+    if (!f) return;
     const ok = await ask({
       title: 'למחוק את המשחק?',
-      body: 'המשחק יימחק מההיסטוריה ומהדוחות' + (gh ? ' וגם מגיט' : '') + '.',
+      body: 'המשחק יימחק מהטורניר, מההיסטוריה ומהדוחות' + (gh ? ', וגם מגיט' : '') + '.',
       buttons: [{ label: 'מחק', value: true, kind: 'danger' }, { label: 'ביטול', value: false }]
     });
     if (!ok) return;
-    state.history = state.history.filter((x) => x.id !== id);
-    const u = state.sync.unsyncedGames.indexOf(id);
-    if (u >= 0) state.sync.unsyncedGames.splice(u, 1);
-    else state.sync.deletedGames.push(SY.gamePath(g));
-    persist();
-    scheduleSync(0);
+    R.removeGame(f.tour, id);
+    saveTour(f.tour);
     toast('המשחק נמחק');
     back();
   }
@@ -1052,7 +1252,7 @@
       sum.players.forEach((s, i) => {
         h += `<tr${i === 0 && s.wins ? ' class="top1"' : ''}><td>${i + 1}</td><td>${esc(s.name)}</td><td>${s.wins}</td><td>${s.games}</td><td>${pct(s.winPct)}</td><td class="num">${s.totalPoints}</td></tr>`;
       });
-      h += '</tbody></table></div><p class="muted" style="margin-top:8px">הדירוג לפי ניצחונות במשחקים. בשוויון, מי שצבר פחות נקודות.</p></section>';
+      h += '</tbody></table></div><p class="muted" style="margin-top:8px">הדירוג כאן לפי ניצחונות במשחקים. בשוויון, מי שצבר פחות נקודות. הטבלה של כל טורניר (לפי נקודות) נמצאת במסך הטורניר ובלשונית "טורנירים".</p></section>';
       h += '<section class="card"><h3>ניצחונות במשחקים</h3>' +
         barChart(sum.players.map((s) => ({ label: s.name, value: s.wins, text: String(s.wins) }))) + '</section>';
       return h;
@@ -1135,8 +1335,8 @@
   };
 
   // Every tournament with games in the period; a row opens that tournament's reports.
-  function toursReport(games) {
-    const rows = T.overview(state.tournaments, games).filter((r) => r.games);
+  function toursReport(pick) {
+    const rows = T.overview(state.tournaments, pick).filter((r) => r.games);
     if (!rows.length) return '<p class="empty">אין משחקים בתקופה הזו.</p>';
     return `<section class="card"><h3>כל הטורנירים</h3><div class="table-scroll"><table class="data tours">
       <thead><tr><th>טורניר</th><th>משחקים</th><th>אחרון</th><th>מוביל</th></tr></thead><tbody>` +
@@ -1144,22 +1344,25 @@
         <tr data-act="pick-tour" data-id="${r.tournament.id}"${view.tour === r.tournament.id ? ' class="top1"' : ''}>
           <td>${esc(r.tournament.name)}${r.tournament.archived ? ' <span class="muted">(בארכיון)</span>' : ''}</td>
           <td>${r.games}</td><td>${fmtDate(r.lastAt)}</td>
-          <td>${esc(r.leader.name)} <span class="muted">(${winsText(r.leader.wins)})</span></td>
+          <td>${esc(r.leaders.map((l) => l.player.name).join(', '))} <span class="muted num">(${r.leaders[0].total})</span></td>
         </tr>`).join('') +
-      '</tbody></table></div><p class="muted" style="margin-top:8px">המוביל הוא מי שניצח בהכי הרבה משחקים. בשוויון, מי שצבר פחות נקודות. לחיצה על טורניר מציגה את הדוחות שלו.</p></section>';
+      '</tbody></table></div><p class="muted" style="margin-top:8px">המוביל הוא מי שצבר הכי מעט נקודות בטורניר. בשוויון, מי שניצח ביותר משחקים. לחיצה על טורניר מציגה את הדוחות שלו.</p></section>';
   }
 
   VIEWS.reports = () => {
     view.period = view.period || 'all';
     view.tab = view.tab || 'winners';
-    const all = ST.finished(state.history);
-    if (!all.length) return '<p class="empty">הדוחות יופיעו אחרי שתסיימו ותשמרו את המשחק הראשון.</p>';
+    const all = allGames();
+    if (!all.length) return '<p class="empty">הדוחות יופיעו אחרי שיסתיים המשחק הראשון.</p>';
     view.tour = validTour(view.tour);
     let h = backupNag();
     h += tourFilter(all);
     h += '<div class="seg">' + PERIODS.map(([v, label]) => `<button class="chip${view.period === v ? ' on' : ''}" data-act="period" data-v="${v}">${label}</button>`).join('') + '</div>';
     h += '<div class="tabs" role="tablist">' + TABS.map(([v, label]) => `<button class="tab${view.tab === v ? ' on' : ''}" role="tab" aria-selected="${view.tab === v}" data-act="tab" data-v="${v}">${label}</button>`).join('') + '</div>';
-    if (view.tab === 'tours') return h + toursReport(ST.filterByPeriod(all, view.period));
+    if (view.tab === 'tours') {
+      const inPeriod = new Set(ST.filterByPeriod(all, view.period).map((g) => g.id));
+      return h + toursReport((g) => inPeriod.has(g.id));
+    }
     const games = ST.filterByPeriod(ST.filterByTournament(all, view.tour), view.period);
     if (!games.length) return h + '<p class="empty">אין משחקים בתקופה הזו.</p>';
     return h + REPORTS[view.tab](ST.summary(games), games);
@@ -1167,31 +1370,33 @@
 
   // ---------- tournaments ----------
   VIEWS.tournaments = () => {
-    const rows = T.overview(state.tournaments, state.history);
-    const inUse = (r) => r.games || (state.current && state.current.tournamentId === r.tournament.id);
+    const rows = T.overview(state.tournaments);
     const card = (r) => {
       const t = r.tournament;
       return `
         <li class="card">
           <div class="hist-top"><b class="tour-title">${esc(t.name)}</b><span>${r.games ? gamesText(r.games) : 'עוד אין משחקים'}</span></div>
-          ${r.leader ? `<div class="muted">מוביל: ${esc(r.leader.name)} (${winsText(r.leader.wins)}) · אחרון: ${fmtDate(r.lastAt)}</div>` : ''}
+          <div class="muted">${esc(names(t).join(' · '))}</div>
+          ${r.open ? `<div class="muted">משחק פתוח · ${openGameText(r.open)}</div>` : ''}
+          ${r.leaders.length ? `<div class="muted">מוביל: ${esc(r.leaders.map((l) => l.player.name).join(', '))} (${r.leaders[0].total} נק׳) · אחרון: ${fmtDate(r.lastAt)}</div>` : ''}
           <div class="tour-actions">
+            <button class="btn sm" data-act="open-tour" data-id="${t.id}">פתח</button>
             ${r.games ? `<button class="btn sm" data-act="tour-reports" data-id="${t.id}">דוחות</button>` : ''}
             <button class="btn sm" data-act="tour-rename" data-id="${t.id}">שנה שם</button>
             <button class="btn sm" data-act="tour-archive" data-id="${t.id}">${t.archived ? 'החזר מהארכיון' : 'לארכיון'}</button>
-            ${inUse(r) ? '' : `<button class="btn sm danger" data-act="tour-delete" data-id="${t.id}">מחק</button>`}
+            ${r.games ? '' : `<button class="btn sm danger" data-act="tour-delete" data-id="${t.id}">מחק</button>`}
           </div>
         </li>`;
     };
     const open = rows.filter((r) => !r.tournament.archived);
     const archived = rows.filter((r) => r.tournament.archived);
     let h = `<h2>טורנירים</h2>
-      <p class="muted">כל הרכב שחקנים מקבל טורניר משלו אוטומטית. כדי להפריד, למשל לפי מקום, פותחים טורניר חדש ובוחרים אותו כשמתחילים משחק.</p>
-      <button class="btn block" data-act="tour-new">+ טורניר חדש</button>
+      <p class="muted">טורניר = משתתפים קבועים וכמה משחקים. כולם משחקים בכל משחק. הטבלה לפי הניקוד הכללי: הכי מעט נקודות במקום הראשון.</p>
+      <button class="btn block" data-act="new-tour">+ טורניר חדש</button>
       <div style="height:12px"></div>`;
-    h += open.length ? `<ul class="list">${open.map(card).join('')}</ul>` : '<p class="empty">עוד אין טורנירים. טורניר נפתח כשמתחילים משחק.</p>';
+    h += open.length ? `<ul class="list">${open.map(card).join('')}</ul>` : '<p class="empty">אין טורנירים פעילים.</p>';
     if (archived.length) {
-      h += `<h2>בארכיון</h2><p class="muted">הם לא מוצעים כשמתחילים משחק, אבל נשארים בדוחות ובהיסטוריה.</p><ul class="list">${archived.map(card).join('')}</ul>`;
+      h += `<h2>בארכיון</h2><p class="muted">הם לא מופיעים במסך הראשי, אבל נשארים בדוחות ובהיסטוריה. משחק חדש בטורניר מחזיר אותו מהארכיון.</p><ul class="list">${archived.map(card).join('')}</ul>`;
     }
     return h;
   };
@@ -1201,56 +1406,42 @@
     return t && t !== except ? 'כבר יש טורניר בשם הזה' : '';
   };
 
-  function tournamentsSaved() {
-    toursChanged();
-    persist();
-    scheduleSync();
-    render();
-  }
-
-  async function newTournament() {
-    const name = await askText({ title: 'טורניר חדש', placeholder: 'למשל: אצל סבתא', okLabel: 'פתח טורניר', validate: (v) => nameTaken(v) });
-    if (!name) return;
-    state.tournaments.push(T.make(name, null));
-    tournamentsSaved();
-    toast('הטורניר נפתח. בוחרים אותו כשמתחילים משחק.');
-  }
-
   async function renameTournament(id) {
-    const t = T.find(state.tournaments, id);
+    const t = tourById(id);
     if (!t) return;
     const name = await askText({ title: 'שם הטורניר', value: t.name, validate: (v) => nameTaken(v, t) });
     if (!name || name === t.name) return;
     t.name = name;
-    T.touch(t);
-    tournamentsSaved();
+    R.touchMeta(t);
+    tourSaved(t);
   }
 
   function toggleArchive(id) {
-    const t = T.find(state.tournaments, id);
+    const t = tourById(id);
     if (!t) return;
     t.archived = !t.archived;
-    T.touch(t);
-    tournamentsSaved();
+    R.touchMeta(t);
+    tourSaved(t);
     toast(t.archived ? 'הטורניר הועבר לארכיון' : 'הטורניר חזר מהארכיון');
   }
 
   async function deleteTournament(id) {
-    const t = T.find(state.tournaments, id);
+    const t = tourById(id);
     if (!t) return;
-    if (T.gamesOf(state.history, id).length || (state.current && state.current.tournamentId === id)) {
-      toast('אפשר למחוק רק טורניר בלי משחקים');
+    if (R.finishedGames(t).length) {
+      toast('אפשר למחוק רק טורניר בלי משחקים שהסתיימו');
       return;
     }
     const ok = await ask({
       title: `למחוק את הטורניר "${t.name}"?`,
+      body: R.openGame(t) ? 'גם המשחק הפתוח בו יימחק.' : '',
       buttons: [{ label: 'מחק', value: true, kind: 'danger' }, { label: 'ביטול', value: false }]
     });
     if (!ok) return;
-    t.deleted = true;
-    T.touch(t);
-    if (state.lastTournamentId === id) state.lastTournamentId = null;
-    tournamentsSaved();
+    state.tournaments[state.tournaments.indexOf(t)] = T.tombstone(t);
+    if (state.activeId === id) state.activeId = null;
+    undoStack = undoStack.filter((u) => u.tid !== id);
+    tourSaved(t);
   }
 
   function tourReports(id) {
@@ -1266,8 +1457,10 @@
 
   // ---------- settings: git + backup ----------
   VIEWS.settings = () => {
+    const games = allGames().length;
+    const open = T.live(state.tournaments).filter((t) => R.openGame(t)).length;
     let h = `<section class="card form"><h2>שמירה בגיט</h2>
-      <p class="muted">כל משחק שמסתיים, וגם המשחק הפתוח אחרי כל שינוי, נשמרים כקבצים במאגר גיטהאב שלך. כך שום דבר לא הולך לאיבוד, ואפשר להמשיך גם מטלפון אחר.</p>`;
+      <p class="muted">כל טורניר נשמר כקובץ אחד במאגר גיטהאב שלך, אחרי כל שינוי: המשתתפים, כל המשחקים עם כל התורים, והמשחק שבאמצע. כך שום דבר לא הולך לאיבוד, ואפשר להמשיך גם מטלפון אחר.</p>`;
     if (gh) {
       h += `<p>מחובר למאגר <b class="num">${esc(gh.owner + '/' + gh.repo)}</b>${gh.private === false ? ' <span style="color:var(--danger)">(ציבורי: כל אחד יכול לראות את התוצאות)</span>' : ''}</p>
         <p id="sync-status" class="muted">${esc(syncStatusText())}</p>
@@ -1297,7 +1490,7 @@
     }
     h += `</section>
       <section class="card"><h2>גיבוי לקובץ</h2>
-        <p class="muted">קובץ אחד עם כל המשחקים. אפשר לשלוח אותו לעצמך ולטעון אותו בטלפון אחר.</p>
+        <p class="muted">קובץ אחד עם כל הטורנירים. אפשר לשלוח אותו לעצמך ולטעון אותו בטלפון אחר.</p>
         <div class="row">
           <button class="btn" data-act="export">ייצוא גיבוי</button>
           <label class="btn">ייבוא גיבוי<input type="file" id="import-file" accept=".json,application/json" hidden></label>
@@ -1305,9 +1498,9 @@
       </section>
       <section class="card"><h2>במכשיר הזה</h2>
         <ul class="stat-list">
-          ${li('משחקים שמורים', state.history.length)}
           ${li('טורנירים', T.live(state.tournaments).length)}
-          ${li('משחק פתוח', state.current ? 'כן' : 'לא')}
+          ${li('משחקים שהסתיימו', games)}
+          ${li('משחקים פתוחים', open)}
         </ul>
       </section>`;
     return h;
@@ -1339,7 +1532,7 @@
   async function ghDisconnect() {
     const ok = await ask({
       title: 'לנתק את הגיט?',
-      body: 'המשחקים יישארו בטלפון ובמאגר, אבל משחקים חדשים לא יישמרו בגיט עד שתתחבר שוב.',
+      body: 'הטורנירים יישארו בטלפון ובמאגר, אבל שינויים חדשים לא יישמרו בגיט עד שתתחבר שוב.',
       buttons: [{ label: 'נתק', value: true, kind: 'danger' }, { label: 'ביטול', value: false }]
     });
     if (!ok) return;
@@ -1348,7 +1541,7 @@
   }
 
   async function exportBackup() {
-    const data = { app: 'rummy51', version: 1, exportedAt: new Date().toISOString(), history: state.history, current: state.current, tournaments: state.tournaments };
+    const data = { app: 'rummy51', version: 2, exportedAt: new Date().toISOString(), tournaments: state.tournaments };
     const name = 'rummy51-backup-' + new Date().toISOString().slice(0, 10) + '.json';
     const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
     const file = typeof File === 'function' ? new File([blob], name, { type: 'application/json' }) : null;
@@ -1371,44 +1564,28 @@
   }
 
   function markBackedUp() {
-    state.backupCount = state.history.length;
+    state.backupCount = allGames().length;
     persist();
     toast('קובץ הגיבוי נוצר');
   }
 
+  // Accepts this version's backup (tournaments) and the previous one's (a list of games).
   function importBackup(file) {
     const reader = new FileReader();
-    reader.onload = async () => {
+    reader.onload = () => {
       let data;
       try { data = JSON.parse(reader.result); } catch (e) { toast('הקובץ לא תקין'); return; }
-      if (!data || !Array.isArray(data.history)) { toast('זה לא קובץ גיבוי של רמי 51'); return; }
-      const before = new Set(state.history.map((g) => g.id));
-      const merged = ST.mergeHistory(state.history, data.history);
-      state.history = merged.games;
-      state.history.forEach((g) => {
-        if (!before.has(g.id) && !state.sync.unsyncedGames.includes(g.id)) state.sync.unsyncedGames.push(g.id);
-      });
-      const mt = T.merge(state.tournaments, data.tournaments || []);
-      state.tournaments = mt.list;
-      if (mt.changed) toursChanged();
-      fixTournaments();
+      let incoming = null;
+      if (data && data.version === 2 && Array.isArray(data.tournaments)) incoming = data.tournaments;
+      else if (data && Array.isArray(data.history)) incoming = T.fromV1(data);
+      if (!incoming) { toast('זה לא קובץ גיבוי של רמי 51'); return; }
+      const m = T.mergeLists(state.tournaments, incoming);
+      state.tournaments = m.list;
+      m.changed.forEach((id) => SY.markDirty(state, id));
+      if (!activeTour() && m.changed.length) state.activeId = m.changed[m.changed.length - 1];
       persist();
-      if (data.current && !data.current.finishedAt && !state.current) {
-        const load = await ask({
-          title: 'בקובץ יש משחק פתוח',
-          body: 'לטעון אותו ולהמשיך לשחק?',
-          buttons: [{ label: 'טען', value: true, kind: 'primary' }, { label: 'לא', value: false }]
-        });
-        if (load) {
-          state.current = data.current;
-          undoStack = [];
-          state.sync.currentVersion++;
-          fixTournaments();
-          persist();
-        }
-      }
       scheduleSync(0);
-      toast(merged.added ? 'נוספו ' + merged.added + ' משחקים' : 'כל המשחקים בקובץ כבר קיימים');
+      toast(m.added ? 'נוספו ' + (m.added === 1 ? 'טורניר 1' : m.added + ' טורנירים') : m.changed.length ? 'עודכנו ' + m.changed.length + ' טורנירים' : 'כל מה שבקובץ כבר קיים');
       render();
     };
     reader.readAsText(file);
@@ -1423,14 +1600,17 @@
       case 'back': back(); break;
       case 'home': goHome(); break;
       case 'go': go(d.to); break;
-      case 'new-game': newGame(); break;
+      case 'new-tour': startSetup(); break;
+      case 'open-tour': openTour(d.id); break;
+      case 'next-game': nextGame(d.id); break;
       case 'pick-dealer': view.firstDealer = +d.i; render(); break;
       case 'move': movePlayer(+d.i, +d.d); break;
       case 'remove-player': removePlayer(+d.i); break;
       case 'add-player': view.names.push(''); render(); document.querySelector(`.pname[data-i="${view.names.length - 1}"]`).focus(); break;
       case 'rounds': view.rounds = Math.min(MAX_ROUNDS, Math.max(1, view.rounds + +d.d)); render(); break;
-      case 'start-game': startGame(); break;
-      case 'open-round': openRound(+d.i); break;
+      case 'start-tour': startTour(); break;
+      case 'start-next': startNext(); break;
+      case 'open-round': openRound(d.gid, +d.i); break;
       case 'close-sheet': closeSheet(); break;
       case 'pick-winner': pickWinner(d.id); break;
       case 'toggle-noset': toggleNoSet(el, d.id); break;
@@ -1442,14 +1622,16 @@
       case 'add-round': addRound(); break;
       case 'finish': finishGame(); break;
       case 'finish-early': finishEarly(); break;
-      case 'discard': confirmDiscard().then((ok) => { if (ok) goHome(); }); break;
-      case 'view-game': go('game-detail', { id: d.id }); break;
-      case 'rematch': startSetup(names(findGame(d.id)), findGame(d.id).tournamentId); break;
+      case 'discard': discardGame(); break;
+      case 'toggle-rounds': view.roundsOpen = !view.roundsOpen; render(); break;
+      case 'player': openPlayer(d.tid, d.pid); break;
+      case 'close-player': closePlayer(); break;
+      case 'edit-round-of': closePlayer(); openRound(d.gid, +d.i); break;
+      case 'view-game': if (psheet) closePlayer(); go('game-detail', { id: d.id }); break;
       case 'delete-game': deleteGame(d.id); break;
       case 'move-game': moveGame(d.id); break;
       case 'pick-tour': tourReports(d.id); break;
       case 'tour-reports': tourReports(d.id); break;
-      case 'tour-new': newTournament(); break;
       case 'tour-rename': renameTournament(d.id); break;
       case 'tour-archive': toggleArchive(d.id); break;
       case 'tour-delete': deleteTournament(d.id); break;
@@ -1466,11 +1648,9 @@
     const t = e.target;
     if (t.classList.contains('pname')) {
       view.names[+t.dataset.i] = t.value;
-      autoTournament(view);
-      refreshTourPick();
+      refreshSetup();
     } else if (t.id === 'tour-name') {
       view.tourName = t.value;
-      view.tourNameEdited = true;
     } else if (t.classList.contains('pts') && sheet) {
       t.value = t.value.replace(/\D/g, '');
       sheet.res.entries[t.dataset.pid].points = t.value;
@@ -1486,13 +1666,6 @@
     else if (field === 'gluck' && sheet) { sheet.gluck = t.checked; updateSheetPreview(); }
     else if (field === 'h2hA' || field === 'h2hB') { view[field] = t.value; render(); }
     else if (field === 'tour') { view.tour = t.value; render(); }
-    else if (field === 'tourSel') {
-      view.tourSel = t.value;
-      view.tourManual = true;
-      refreshTourPick();
-      const input = document.getElementById('tour-name');
-      if (input) { input.focus(); input.select(); }
-    }
     else if (t.id === 'import-file' && t.files && t.files[0]) { importBackup(t.files[0]); t.value = ''; }
   });
 
@@ -1510,13 +1683,15 @@
   });
 
   // ---------- start ----------
-  if (fixTournaments()) persist();
-  if (state.current) {
+  if (converted) persist();
+  const start = activeTour();
+  if (start && R.openGame(start)) {
     stack = [{ name: 'home' }];
-    view = { name: 'game' };
+    view = { name: 'tournament', id: start.id };
     history.pushState({ rummy: 1 }, '');
   }
   render();
+  if (converted) toast('הנתונים עברו למבנה החדש: ' + (converted === 1 ? 'טורניר 1' : converted + ' טורנירים'));
   if (gh) pullFromGit(true);
   const local = ['localhost', '127.0.0.1'].includes(location.hostname);
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || local)) {
