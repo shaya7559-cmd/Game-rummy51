@@ -1,15 +1,19 @@
-/* Rummy 51 — saves games to a GitHub repository through the contents API.
-   data/games/<date>_<id>.json  one file per finished game
-   data/current.json            the game in progress (removed when there is none)
-   data/tournaments.json        the list of tournaments
+/* Rummy 51 — saves tournaments to a GitHub repository through the contents API.
+   data/tournaments/<id>.json  one file per tournament: its participants and all its games with every round,
+                               also the game being played (so another phone can continue it),
+                               and a readable digest ("summary": table, every game's totals) for reports.
+   The previous version's files (data/games/, data/current.json, data/tournaments.json) are read once,
+   converted, and then left as they are.
+   state.sync = { dirty: { id: version }, shas: { id: sha }, legacyDone, lastSyncAt, lastError }
    The token lives only in this device's localStorage; it is never part of the app's code. */
 (function (root) {
   'use strict';
 
   var API = 'https://api.github.com';
-  var GAMES_DIR = 'data/games';
-  var CURRENT = 'data/current.json';
-  var TOURNAMENTS = 'data/tournaments.json';
+  var DIR = 'data/tournaments';
+  var LEGACY_GAMES = 'data/games';
+  var LEGACY_CURRENT = 'data/current.json';
+  var LEGACY_TOURNAMENTS = 'data/tournaments.json';
 
   // Tests replace fetchImpl with a fake GitHub.
   var Sync = { fetchImpl: null };
@@ -19,10 +23,7 @@
   }
 
   function emptySync() {
-    return {
-      currentVersion: 0, syncedVersion: 0, tournamentsVersion: 0, tournamentsSynced: 0,
-      unsyncedGames: [], deletedGames: [], lastSyncAt: null, lastError: null
-    };
+    return { dirty: {}, shas: {}, legacyDone: false, lastSyncAt: null, lastError: null };
   }
 
   // Accepts "owner/repo", "https://github.com/owner/repo" or "...repo.git".
@@ -105,126 +106,141 @@
     return Array.isArray(list) ? list : [];
   }
 
-  async function putJSON(cfg, path, data, message) {
-    var existing = await request(cfg, 'GET', contentsPath(cfg, path));
-    var body = { message: message, content: b64encode(JSON.stringify(data, null, 1) + '\n') };
-    if (existing && existing.sha) body.sha = existing.sha;
-    await request(cfg, 'PUT', contentsPath(cfg, path), body);
+  function tournamentPath(id) {
+    return DIR + '/' + id + '.json';
   }
 
-  async function deleteFile(cfg, path, message) {
-    var existing = await request(cfg, 'GET', contentsPath(cfg, path));
-    if (!existing || !existing.sha) return;
-    await request(cfg, 'DELETE', contentsPath(cfg, path), { message: message, sha: existing.sha });
-  }
-
-  function gamePath(game) {
-    return GAMES_DIR + '/' + (game.finishedAt || game.createdAt).slice(0, 10) + '_' + game.id + '.json';
-  }
-
-  function idFromFileName(name) {
-    var m = /_([a-z0-9]+)\.json$/.exec(name);
-    return m ? m[1] : null;
-  }
-
-  function gameTitle(game) {
-    var winner = null;
-    game.players.forEach(function (p) { if (p.id === game.winnerId) winner = p.name; });
-    return (game.finishedAt || '').slice(0, 10) + (winner ? ' — ניצח ' + winner : '');
+  function markDirty(state, id) {
+    state.sync.dirty[id] = (state.sync.dirty[id] || 0) + 1;
   }
 
   function pending(state) {
-    var s = state.sync;
-    return s.unsyncedGames.length + s.deletedGames.length +
-      (s.currentVersion !== s.syncedVersion ? 1 : 0) + (s.tournamentsVersion !== s.tournamentsSynced ? 1 : 0);
+    return Object.keys(state.sync.dirty).length;
   }
 
-  function removeFrom(list, item) {
-    var i = list.indexOf(item);
-    if (i >= 0) list.splice(i, 1);
+  function commitMessage(t) {
+    if (t.deleted) return 'מחיקת טורניר ' + t.name;
+    var R = root.Rummy;
+    var open = R.openGame(t);
+    var done = R.finishedGames(t).length;
+    return 'טורניר ' + t.name + ' — ' + done + ' משחקים' + (open ? ', משחק פתוח: שוחקו ' + R.playedCount(open) + ' תורים' : '');
   }
 
-  // Pushes everything waiting: finished games, deletions, tournaments and the game in progress.
-  // Mutates state.sync; the caller persists it.
+  // The file: the raw data, with the digest right after the name so it is easy to read.
+  function fileContent(t) {
+    var out = { id: t.id, name: t.name };
+    if (!t.deleted) out.summary = root.Rummy.digest(t);
+    Object.keys(t).forEach(function (k) { if (!(k in out)) out[k] = t[k]; });
+    return b64encode(JSON.stringify(out, null, 1) + '\n');
+  }
+
+  function indexOfId(list, id) {
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return i;
+    return -1;
+  }
+
+  // Brings a copy from the repository into the local list. Returns the merge result.
+  function takeRemote(state, data) {
+    var i = indexOfId(state.tournaments, data.id);
+    var m = root.RummyTournaments.mergeTournament(i >= 0 ? state.tournaments[i] : null, data);
+    if (m.changed) {
+      if (i >= 0) state.tournaments[i] = m.tournament;
+      else state.tournaments.push(m.tournament);
+    }
+    return m;
+  }
+
+  // Writes one tournament. When the file changed in the repository since this phone last saw it
+  // (another phone saved it), that copy is merged in first, so nothing is lost.
+  async function putTournament(state, cfg, id) {
+    var path = contentsPath(cfg, tournamentPath(id));
+    var t = state.tournaments[indexOfId(state.tournaments, id)];
+    var sha = state.sync.shas[id];
+    var res;
+    try {
+      res = await request(cfg, 'PUT', path, { message: commitMessage(t), content: fileContent(t), sha: sha });
+    } catch (e) {
+      if (e.status !== 409 && e.status !== 422) throw e;
+      var got = await getJSON(cfg, tournamentPath(id));
+      if (got && got.data) takeRemote(state, got.data);
+      t = state.tournaments[indexOfId(state.tournaments, id)];
+      res = await request(cfg, 'PUT', path, { message: commitMessage(t), content: fileContent(t), sha: got ? got.sha : undefined });
+    }
+    if (res && res.content && res.content.sha) state.sync.shas[id] = res.content.sha;
+  }
+
+  // Pushes every tournament that changed. A tournament that changes while it is being sent stays pending.
+  // Mutates state; the caller persists it.
   async function flush(state, cfg) {
     var s = state.sync;
-    var done = 0;
-    var ids = s.unsyncedGames.slice();
+    var ids = Object.keys(s.dirty);
     for (var i = 0; i < ids.length; i++) {
-      var game = null;
-      state.history.forEach(function (g) { if (g.id === ids[i]) game = g; });
-      if (game) await putJSON(cfg, gamePath(game), game, 'משחק ' + gameTitle(game));
-      removeFrom(s.unsyncedGames, ids[i]);
-      done++;
-    }
-    var paths = s.deletedGames.slice();
-    for (var j = 0; j < paths.length; j++) {
-      await deleteFile(cfg, paths[j], 'מחיקת משחק');
-      removeFrom(s.deletedGames, paths[j]);
-      done++;
-    }
-    if (s.tournamentsVersion !== s.tournamentsSynced) {
-      var tVersion = s.tournamentsVersion;
-      await putJSON(cfg, TOURNAMENTS, { tournaments: state.tournaments || [] }, 'עדכון טורנירים');
-      s.tournamentsSynced = tVersion;
-      done++;
-    }
-    if (s.currentVersion !== s.syncedVersion) {
-      // Snapshot first: the game may change while the request is in flight.
-      var version = s.currentVersion;
-      var snapshot = state.current ? JSON.parse(JSON.stringify(state.current)) : null;
-      if (snapshot) {
-        var played = snapshot.rounds.filter(function (r) { return r.result; }).length;
-        await putJSON(cfg, CURRENT, snapshot, 'משחק פתוח — שוחקו ' + played + ' תורים');
-      } else {
-        await deleteFile(cfg, CURRENT, 'אין משחק פתוח');
-      }
-      s.syncedVersion = version;
-      done++;
+      var id = ids[i];
+      var version = s.dirty[id];
+      if (indexOfId(state.tournaments, id) >= 0) await putTournament(state, cfg, id);
+      if (s.dirty[id] === version) delete s.dirty[id];
     }
     s.lastSyncAt = new Date().toISOString();
     s.lastError = null;
-    return done;
+    return ids.length;
   }
 
-  // Brings in finished games and tournaments that exist only in the repository, and queues
-  // what exists only here. Returns the repository's game in progress so the caller can offer it.
+  // The previous version's files, in the shape it kept them on the phone: { history, current, tournaments }.
+  async function readLegacy(cfg) {
+    var files = (await listDir(cfg, LEGACY_GAMES)).filter(function (f) { return f.type === 'file' && /\.json$/.test(f.name); });
+    var history = [];
+    for (var i = 0; i < files.length; i++) {
+      var got = await getJSON(cfg, files[i].path);
+      if (got && got.data && got.data.id && got.data.finishedAt) history.push(got.data);
+    }
+    var cur = await getJSON(cfg, LEGACY_CURRENT);
+    var tours = await getJSON(cfg, LEGACY_TOURNAMENTS);
+    return {
+      history: history,
+      current: cur && cur.data && !cur.data.finishedAt ? cur.data : null,
+      tournaments: tours && tours.data && Array.isArray(tours.data.tournaments) ? tours.data.tournaments : []
+    };
+  }
+
+  // Brings in tournaments that changed in the repository and queues what exists only here.
+  // Only files whose sha changed since the last pull are downloaded. The first time, the previous
+  // version's files are converted and merged in too.
   async function pull(state, cfg) {
     var s = state.sync;
-    var files = (await listDir(cfg, GAMES_DIR)).filter(function (f) {
-      return f.type === 'file' && /\.json$/.test(f.name);
-    });
-    var have = {};
-    state.history.forEach(function (g) { have[g.id] = true; });
-    var remoteIds = {};
-    var added = 0;
+    var files = (await listDir(cfg, DIR)).filter(function (f) { return f.type === 'file' && /\.json$/.test(f.name); });
+    var remote = {};
+    var added = 0, updated = 0;
     for (var i = 0; i < files.length; i++) {
-      var id = idFromFileName(files[i].name);
-      if (!id) continue;
-      remoteIds[id] = true;
-      if (have[id] || s.deletedGames.indexOf(files[i].path) >= 0) continue;
+      var id = files[i].name.replace(/\.json$/, '');
+      remote[id] = true;
+      if (s.shas[id] === files[i].sha) continue;
       var got = await getJSON(cfg, files[i].path);
-      if (got && got.data && got.data.id && got.data.finishedAt) {
-        state.history.push(got.data);
-        have[got.data.id] = true;
-        added++;
-      }
+      if (!got || !got.data || got.data.id !== id) continue;
+      var isNew = indexOfId(state.tournaments, id) < 0;
+      var m = takeRemote(state, got.data);
+      if (m.changed) { if (isNew && !got.data.deleted) added++; else if (!isNew) updated++; }
+      if (m.ahead) markDirty(state, id);
+      s.shas[id] = got.sha;
     }
-    state.history.sort(function (a, b) { return a.finishedAt.localeCompare(b.finishedAt); });
-    state.history.forEach(function (g) {
-      if (!remoteIds[g.id] && s.unsyncedGames.indexOf(g.id) < 0) s.unsyncedGames.push(g.id);
+    if (!s.legacyDone) {
+      var old = await readLegacy(cfg);
+      var conv = root.RummyTournaments.fromV1(old);
+      conv.forEach(function (t) {
+        var isNew = indexOfId(state.tournaments, t.id) < 0;
+        var m = takeRemote(state, t);
+        if (m.changed) { if (isNew) added++; else updated++; }
+      });
+      s.legacyDone = true;
+    }
+    state.tournaments.forEach(function (t) {
+      if (remote[t.id]) return;
+      delete s.shas[t.id];
+      if (!s.dirty[t.id]) markDirty(state, t.id);
     });
-    var remoteT = await getJSON(cfg, TOURNAMENTS);
-    var merged = root.RummyTournaments.merge(state.tournaments || [], remoteT && remoteT.data ? remoteT.data.tournaments : []);
-    state.tournaments = merged.list;
-    if (merged.ahead) s.tournamentsVersion++;
-    var cur = await getJSON(cfg, CURRENT);
-    return { added: added, remoteCurrent: cur ? cur.data : null };
+    return { added: added, updated: updated };
   }
 
-  Sync.GAMES_DIR = GAMES_DIR;
-  Sync.CURRENT = CURRENT;
-  Sync.TOURNAMENTS = TOURNAMENTS;
+  Sync.DIR = DIR;
   Sync.emptySync = emptySync;
   Sync.parseRepo = parseRepo;
   Sync.b64encode = b64encode;
@@ -232,11 +248,11 @@
   Sync.check = check;
   Sync.getJSON = getJSON;
   Sync.listDir = listDir;
-  Sync.putJSON = putJSON;
-  Sync.deleteFile = deleteFile;
-  Sync.gamePath = gamePath;
+  Sync.tournamentPath = tournamentPath;
+  Sync.markDirty = markDirty;
   Sync.pending = pending;
   Sync.flush = flush;
+  Sync.readLegacy = readLegacy;
   Sync.pull = pull;
 
   root.RummySync = Sync;

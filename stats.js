@@ -155,20 +155,6 @@
     return out;
   }
 
-  // Union by id. When both sides have a game, the one updated last wins.
-  function mergeHistory(local, incoming) {
-    var map = {};
-    var added = 0;
-    local.forEach(function (g) { map[g.id] = g; });
-    (incoming || []).forEach(function (g) {
-      if (!g || !g.id || !g.finishedAt) return;
-      var have = map[g.id];
-      if (!have) added++;
-      if (!have || (g.updatedAt || '') > (have.updatedAt || '')) map[g.id] = g;
-    });
-    return { games: finished(Object.keys(map).map(function (id) { return map[id]; })), added: added };
-  }
-
   var RummyStats = {
     finished: finished,
     filterByTournament: filterByTournament,
@@ -176,8 +162,7 @@
     lastGame: lastGame,
     playerNames: playerNames,
     summary: summary,
-    headToHead: headToHead,
-    mergeHistory: mergeHistory
+    headToHead: headToHead
   };
 
   root.RummyStats = RummyStats;
